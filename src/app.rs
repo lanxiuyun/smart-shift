@@ -85,12 +85,8 @@ impl fmt::Display for AppError {
 impl Error for AppError {}
 
 pub fn run(args: CliArgs) -> Result<(), AppError> {
-    if args.listen {
+    if args.listen || args.line.is_empty() {
         return run_listener(args.interval_ms);
-    }
-
-    if args.line.is_empty() {
-        return Err(AppError::MissingLine);
     }
 
     let context = LineContext::new(args.line, args.cursor)

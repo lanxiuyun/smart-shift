@@ -4,6 +4,15 @@ use std::mem::size_of;
 use std::ptr::null_mut;
 use std::thread;
 use std::time::Duration;
+use windows::Win32::Foundation::HWND as WinHwnd;
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
+    IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+    TextUnit_Line, UIA_TextPatternId,
+};
 
 pub struct WindowsImeController;
 
@@ -70,18 +79,39 @@ struct ForegroundSnapshot {
     caret_top: i32,
     caret_right: i32,
     caret_bottom: i32,
-    focused_edit: Option<FocusedEditSnapshot>,
-    focused_edit_error: Option<String>,
+    text_snapshot: TextSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FocusedEditSnapshot {
+struct TextSnapshot {
+    source: &'static str,
     selection_start_utf16: usize,
     selection_end_utf16: usize,
     line_index: usize,
     line_cursor_utf16: usize,
     line_cursor_chars: usize,
     line_text: String,
+    attempts: Vec<TextReadAttempt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextReadAttempt {
+    source: &'static str,
+    result: TextReadResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TextReadResult {
+    Unsupported(&'static str),
+    Failed(&'static str),
+}
+
+impl TextReadResult {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unsupported(reason) | Self::Failed(reason) => reason,
+        }
+    }
 }
 
 fn capture_foreground_snapshot() -> Result<ForegroundSnapshot, String> {
@@ -111,7 +141,7 @@ fn capture_foreground_snapshot() -> Result<ForegroundSnapshot, String> {
         class_name(focus_hwnd)
     };
 
-    let (focused_edit, focused_edit_error) = capture_focused_edit(focus_hwnd, &focus_class);
+    let text_snapshot = capture_text_snapshot(focus_hwnd, &focus_class);
 
     Ok(ForegroundSnapshot {
         foreground_hwnd: hwnd as isize,
@@ -124,61 +154,186 @@ fn capture_foreground_snapshot() -> Result<ForegroundSnapshot, String> {
         caret_top: gui_info.rcCaret.top,
         caret_right: gui_info.rcCaret.right,
         caret_bottom: gui_info.rcCaret.bottom,
-        focused_edit,
-        focused_edit_error,
+        text_snapshot,
     })
 }
 
-fn capture_focused_edit(
-    hwnd: HWND,
-    class_name: &str,
-) -> (Option<FocusedEditSnapshot>, Option<String>) {
+fn capture_text_snapshot(hwnd: HWND, class_name: &str) -> TextSnapshot {
+    let mut attempts = Vec::new();
+
+    match capture_win32_edit_text(hwnd, class_name) {
+        Ok(mut snapshot) => {
+            snapshot.attempts = attempts;
+            return snapshot;
+        }
+        Err(result) => attempts.push(TextReadAttempt {
+            source: "win32_edit",
+            result,
+        }),
+    }
+
+    match capture_uia_text(hwnd) {
+        Ok(mut snapshot) => {
+            snapshot.attempts = attempts;
+            return snapshot;
+        }
+        Err(result) => attempts.push(TextReadAttempt {
+            source: "uia_text_pattern",
+            result,
+        }),
+    }
+
+    match capture_app_adapter_text(hwnd, class_name) {
+        Ok(mut snapshot) => {
+            snapshot.attempts = attempts;
+            return snapshot;
+        }
+        Err(result) => attempts.push(TextReadAttempt {
+            source: "app_adapter",
+            result,
+        }),
+    }
+
+    TextSnapshot {
+        source: "unsupported",
+        selection_start_utf16: 0,
+        selection_end_utf16: 0,
+        line_index: 0,
+        line_cursor_utf16: 0,
+        line_cursor_chars: 0,
+        line_text: String::new(),
+        attempts,
+    }
+}
+
+fn capture_win32_edit_text(hwnd: HWND, class_name: &str) -> Result<TextSnapshot, TextReadResult> {
     if hwnd.is_null() || !is_supported_edit_class(class_name) {
-        return (None, Some("unsupported_control_class".to_string()));
+        return Err(TextReadResult::Unsupported("unsupported_control_class"));
     }
 
     let (selection_start_utf16, selection_end_utf16) = match edit_selection(hwnd) {
         Some(value) => value,
-        None => return (None, Some("selection_read_failed".to_string())),
+        None => return Err(TextReadResult::Failed("selection_read_failed")),
     };
     let line_index = match edit_line_from_char(hwnd, selection_start_utf16) {
         Some(value) => value,
-        None => return (None, Some("line_from_char_failed".to_string())),
+        None => return Err(TextReadResult::Failed("line_from_char_failed")),
     };
     let line_start_utf16 = match edit_line_index(hwnd, line_index) {
         Some(value) => value,
-        None => return (None, Some("line_index_failed".to_string())),
+        None => return Err(TextReadResult::Failed("line_index_failed")),
     };
     let line_len_utf16 = match edit_line_length(hwnd, line_start_utf16) {
         Some(value) => value,
-        None => return (None, Some("line_length_failed".to_string())),
+        None => return Err(TextReadResult::Failed("line_length_failed")),
     };
     if selection_start_utf16 < line_start_utf16 {
-        return (None, Some("line_range_out_of_bounds".to_string()));
+        return Err(TextReadResult::Failed("line_range_out_of_bounds"));
     }
 
     let line_utf16 = match edit_get_line(hwnd, line_index, line_len_utf16) {
         Some(value) => value,
-        None => return (None, Some("line_read_failed".to_string())),
+        None => return Err(TextReadResult::Failed("line_read_failed")),
     };
     let line_text = String::from_utf16_lossy(&line_utf16);
     let line_cursor_utf16 = selection_start_utf16 - line_start_utf16;
     let line_cursor_chars = match utf16_units_to_char_index(&line_utf16, line_cursor_utf16) {
         Some(value) => value,
-        None => return (None, Some("cursor_utf16_to_char_failed".to_string())),
+        None => return Err(TextReadResult::Failed("cursor_utf16_to_char_failed")),
     };
 
-    (
-        Some(FocusedEditSnapshot {
-            selection_start_utf16,
-            selection_end_utf16,
-            line_index,
-            line_cursor_utf16,
-            line_cursor_chars,
-            line_text,
-        }),
-        None,
-    )
+    Ok(TextSnapshot {
+        source: "win32_edit",
+        selection_start_utf16,
+        selection_end_utf16,
+        line_index,
+        line_cursor_utf16,
+        line_cursor_chars,
+        line_text,
+        attempts: Vec::new(),
+    })
+}
+
+fn capture_uia_text(hwnd: HWND) -> Result<TextSnapshot, TextReadResult> {
+    if hwnd.is_null() {
+        return Err(TextReadResult::Unsupported("missing_focus_hwnd"));
+    }
+
+    read_uia_text(hwnd).map_err(|_| TextReadResult::Unsupported("uia_text_pattern_unavailable"))
+}
+
+fn capture_app_adapter_text(_hwnd: HWND, class_name: &str) -> Result<TextSnapshot, TextReadResult> {
+    let reason = match class_name {
+        "Chrome_WidgetWin_1" => "electron_adapter_not_connected",
+        _ => "no_app_adapter",
+    };
+    Err(TextReadResult::Unsupported(reason))
+}
+
+fn read_uia_text(hwnd: HWND) -> Result<TextSnapshot, windows::core::Error> {
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
+
+    let result = unsafe {
+        let automation: IUIAutomation =
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+        let element = focused_uia_element(&automation, hwnd)?;
+        let pattern: IUIAutomationTextPattern = element.GetCurrentPatternAs(UIA_TextPatternId)?;
+        let selection = pattern.GetSelection()?;
+        if selection.Length()? <= 0 {
+            return Err(windows::core::Error::from_win32());
+        }
+
+        let selected_range = selection.GetElement(0)?;
+        uia_range_to_line_snapshot(&selected_range)
+    };
+
+    if com_initialized {
+        unsafe { CoUninitialize() };
+    }
+
+    result
+}
+
+fn focused_uia_element(
+    automation: &IUIAutomation,
+    hwnd: HWND,
+) -> Result<IUIAutomationElement, windows::core::Error> {
+    match unsafe { automation.GetFocusedElement() } {
+        Ok(element) => Ok(element),
+        Err(_) => unsafe { automation.ElementFromHandle(WinHwnd(hwnd)) },
+    }
+}
+
+fn uia_range_to_line_snapshot(
+    selected_range: &IUIAutomationTextRange,
+) -> Result<TextSnapshot, windows::core::Error> {
+    let line_range = unsafe { selected_range.Clone()? };
+    unsafe { line_range.ExpandToEnclosingUnit(TextUnit_Line)? };
+
+    let cursor_prefix = unsafe { line_range.Clone()? };
+    unsafe {
+        cursor_prefix.MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            selected_range,
+            TextPatternRangeEndpoint_Start,
+        )?
+    };
+
+    let line_text = unsafe { line_range.GetText(-1)? }.to_string();
+    let cursor_text = unsafe { cursor_prefix.GetText(-1)? }.to_string();
+    let line_cursor_chars = cursor_text.chars().count();
+    let line_cursor_utf16 = cursor_text.encode_utf16().count();
+
+    Ok(TextSnapshot {
+        source: "uia_text_pattern",
+        selection_start_utf16: line_cursor_utf16,
+        selection_end_utf16: line_cursor_utf16,
+        line_index: 0,
+        line_cursor_utf16,
+        line_cursor_chars,
+        line_text,
+        attempts: Vec::new(),
+    })
 }
 
 fn print_snapshot(snapshot: &ForegroundSnapshot) {
@@ -199,7 +354,9 @@ fn print_snapshot(snapshot: &ForegroundSnapshot) {
         snapshot.caret_bottom
     );
 
-    if let Some(edit) = &snapshot.focused_edit {
+    if snapshot.text_snapshot.source != "unsupported" {
+        let edit = &snapshot.text_snapshot;
+        println!("text_source={}", edit.source);
         println!(
             "selection utf16=({}, {}) line_index={} line_cursor_utf16={} line_cursor_chars={}",
             edit.selection_start_utf16,
@@ -211,8 +368,12 @@ fn print_snapshot(snapshot: &ForegroundSnapshot) {
         println!("line_text={}", edit.line_text);
     } else {
         println!("line_text=unsupported");
-        if let Some(error) = &snapshot.focused_edit_error {
-            println!("line_text_error={error}");
+        for attempt in &snapshot.text_snapshot.attempts {
+            println!(
+                "text_attempt source={} result={}",
+                attempt.source,
+                attempt.result.as_str()
+            );
         }
     }
 }

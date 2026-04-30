@@ -35,13 +35,13 @@ cargo run -- --line "hello 中文" --cursor 6
 运行：
 
 ```powershell
-cargo run -- --listen
+cargo run
 ```
 
 可选轮询间隔：
 
 ```powershell
-cargo run -- --listen --interval-ms 150
+cargo run -- --interval-ms 150
 ```
 
 当前会持续输出：
@@ -52,20 +52,20 @@ cargo run -- --listen --interval-ms 150
 - GUI 线程 id
 - caret 所在窗口句柄
 - caret 矩形位置
-- 如果当前聚焦的是标准 `Edit/RichEdit` 控件，还会输出当前行文本、选区位置、当前行序号、行内光标位置
+- 如果能读取当前文本，还会输出读取来源、当前行文本、选区位置、当前行序号、行内光标位置
+- 如果读取失败，会输出每一层读取策略的失败原因
 
 这个模式的目标是先确认 Windows 监听链路是通的。它现在还不会：
 
 - 自动切换系统输入法
 
-当前文本抓取的支持范围有限，主要面向：
+当前文本抓取会按顺序尝试：
 
-- `Edit`
-- `RichEdit20W`
-- `RichEdit50W`
-- `RichEditD2DPT`
+- Win32 `Edit/RichEdit`
+- Windows UI Automation `TextPattern`
+- 应用专用适配器
 
-对于浏览器、自绘编辑器、Electron、IDE 自定义文本区，这一版大概率会显示 `line_text=unsupported`。
+对于浏览器、自绘编辑器、Electron、IDE 自定义文本区，能否读取取决于目标应用是否暴露 UI Automation 文本信息；如果不暴露，会显示 `line_text=unsupported` 和对应的 `text_attempt` 失败原因。
 
 ## 下一步
 
