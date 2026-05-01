@@ -1,3 +1,5 @@
+use crate::classifier::{Decision, classify};
+use crate::context::LineContext;
 use crate::ime::InputMode;
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -473,6 +475,7 @@ fn print_snapshot(snapshot: &ForegroundSnapshot) {
             edit.line_cursor_chars
         );
         println!("line_text={}", edit.line_text);
+        print_snapshot_decision(edit);
     } else {
         println!("line_text=unsupported");
         for attempt in &snapshot.text_snapshot.attempts {
@@ -483,6 +486,23 @@ fn print_snapshot(snapshot: &ForegroundSnapshot) {
             );
         }
     }
+}
+
+fn print_snapshot_decision(snapshot: &TextSnapshot) {
+    match classify_snapshot(snapshot) {
+        Ok(decision) => {
+            println!("target_mode={}", decision.mode);
+            println!("reason={}", decision.reason);
+        }
+        Err((cursor, text_len)) => {
+            println!("classification=unavailable cursor={cursor} text_len={text_len}");
+        }
+    }
+}
+
+fn classify_snapshot(snapshot: &TextSnapshot) -> Result<Decision, (usize, usize)> {
+    let context = LineContext::new(snapshot.line_text.clone(), snapshot.line_cursor_chars)?;
+    Ok(classify(&context))
 }
 
 fn window_title(hwnd: HWND) -> String {
@@ -672,6 +692,7 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{ForegroundSnapshot, TextReadAttempt, TextSnapshot, utf16_units_to_char_index};
+    use crate::ime::InputMode;
 
     fn snapshot(line_text: &str) -> ForegroundSnapshot {
         ForegroundSnapshot {
@@ -858,5 +879,26 @@ mod tests {
         current.text_snapshot.line_cursor_chars = 4;
 
         assert!(!super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn classifies_supported_snapshot_line() {
+        let mut snapshot = snapshot("hello world");
+        snapshot.text_snapshot.line_cursor_chars = 1;
+
+        let decision = super::classify_snapshot(&snapshot.text_snapshot).unwrap();
+
+        assert_eq!(decision.mode, InputMode::English);
+    }
+
+    #[test]
+    fn reports_unavailable_classification_for_invalid_cursor() {
+        let mut snapshot = snapshot("abc");
+        snapshot.text_snapshot.line_cursor_chars = 4;
+
+        assert_eq!(
+            super::classify_snapshot(&snapshot.text_snapshot),
+            Err((4, 3))
+        );
     }
 }

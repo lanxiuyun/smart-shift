@@ -20,6 +20,7 @@ Implemented:
 - Win32 `Edit/RichEdit` text snapshot reading
 - UI Automation `TextPattern` text snapshot reading
 - Trigger filtering for cursor relocation vs. text editing
+- Listener-mode classification output for emitted text snapshots
 
 Not implemented yet:
 
@@ -71,6 +72,8 @@ Fields printed by the watcher:
 - `line_cursor_utf16`: cursor offset within the current line in UTF-16 units
 - `line_cursor_chars`: cursor offset within the current line in Rust `char` units
 - `line_text`: current visible line text
+- `target_mode`: classifier output for the current line and cursor, when text is supported
+- `reason`: classifier reason for `target_mode`, when text is supported
 
 ## Key Files
 
