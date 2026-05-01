@@ -102,7 +102,9 @@ fn should_emit_snapshot(
     }
 
     if previous_text.document_len_utf16 != current_text.document_len_utf16 {
-        return false;
+        return previous_text.source == "uia_text_pattern"
+            && current_text.source == "uia_text_pattern"
+            && previous_text.line_index != current_text.line_index;
     }
 
     if previous_text.line_text != current_text.line_text {
@@ -697,6 +699,12 @@ mod tests {
         }
     }
 
+    fn uia_snapshot(line_text: &str) -> ForegroundSnapshot {
+        let mut snapshot = snapshot(line_text);
+        snapshot.text_snapshot.source = "uia_text_pattern";
+        snapshot
+    }
+
     #[test]
     fn utf16_offsets_match_ascii_char_count() {
         let data: Vec<u16> = "hello".encode_utf16().collect();
@@ -815,6 +823,39 @@ mod tests {
         current.text_snapshot.line_cursor_chars = 4;
         current.caret_left = 40;
         current.caret_right = 41;
+
+        assert!(!super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn emits_uia_line_move_when_document_length_changes() {
+        let previous = uia_snapshot("  ## PasteDrop");
+        let mut current = uia_snapshot("publish to juejin, linux do, hello github, ruan");
+        current.text_snapshot.document_len_utf16 = previous.text_snapshot.document_len_utf16 - 3;
+        current.text_snapshot.line_index = 10;
+        current.text_snapshot.selection_start_utf16 = 93;
+        current.text_snapshot.selection_end_utf16 = 93;
+        current.text_snapshot.line_cursor_utf16 = 6;
+        current.text_snapshot.line_cursor_chars = 6;
+
+        let mut previous = previous;
+        previous.text_snapshot.line_index = 9;
+        previous.text_snapshot.selection_start_utf16 = 84;
+        previous.text_snapshot.selection_end_utf16 = 84;
+        previous.text_snapshot.line_cursor_utf16 = 9;
+        previous.text_snapshot.line_cursor_chars = 9;
+
+        assert!(super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn still_ignores_uia_same_line_text_edits() {
+        let previous = uia_snapshot("abc");
+        let mut current = uia_snapshot("abcd");
+        current.text_snapshot.selection_start_utf16 = 4;
+        current.text_snapshot.selection_end_utf16 = 4;
+        current.text_snapshot.line_cursor_utf16 = 4;
+        current.text_snapshot.line_cursor_chars = 4;
 
         assert!(!super::should_emit_snapshot(Some(&previous), &current));
     }
