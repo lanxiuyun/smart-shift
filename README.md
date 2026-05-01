@@ -21,6 +21,9 @@ Trigger notes:
 - Each emitted snapshot also prints `current_ime_mode=chinese|english|unknown`, derived from `ImmGetOpenStatus` on the focused control.
 - In listener mode, when `current_ime_mode` is known and differs from `target_mode`, the watcher now attempts an automatic IMM-based mode switch and prints the switch result.
 - `cargo run -- --line "hello 中文" --cursor 0 --apply` now switches the focused control's IMM open status: Chinese opens IME, English closes it.
+- Known issue: manual `Shift` IME toggles currently cause a new watcher emission because `ime_mode` changes are treated as observable state changes.
+- Known issue: weak-signal lines such as blank UIA placeholders may classify as `target_mode=english` with `reason=default_english`, which can cause an unwanted auto-switch back to English.
+- Planned fix: if the user manually toggles IME mode with `Shift` and remains in the same input control, automatic switching should stay paused until the user clicks or focuses a different input control.
 
 `smart-shift` 是一个准备运行在 Windows 上的输入法自动切换工具。
 
