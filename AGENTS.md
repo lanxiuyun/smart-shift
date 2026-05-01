@@ -39,6 +39,7 @@ Should trigger:
 - Selection changed within the same input control
 - Mouse click moved the insertion point
 - Long wrapped text moved to another visible line while document length stayed the same
+- UIA editor cursor moved to another UIA line, even if the reported document length changes
 
 Should not trigger:
 
@@ -48,14 +49,16 @@ Should not trigger:
 
 Current decision rule in `src/platform/windows.rs`:
 
-- If `document_len_utf16` changed, treat it as editing and do not emit
+- If `document_len_utf16` changed, normally treat it as editing and do not emit
+- Exception: for `uia_text_pattern`, if `line_index` changed, treat it as cursor relocation and emit
 - If document length stayed the same and selection/cursor/caret/visible line changed, emit
 
 Important nuance:
 
-- `line_index` is a logical line index based on real newline characters
-- In Electron/Chromium/UIA editors such as Obsidian, long wrapped text may change visible line text without changing `line_index`
-- Because of that, wrapped-line movement must not rely only on `line_index`
+- For `win32_edit`, `line_index` is based on the control's logical line APIs.
+- For `uia_text_pattern`, `line_index`, `line_cursor_utf16`, and `line_cursor_chars` are based on UI Automation `TextUnit_Line`, not on newline characters in `DocumentRange.GetText()`.
+- In Electron/Chromium/UIA editors such as Obsidian, UIA may expose rendered Markdown lines and change `document_len_utf16` when moving between source-like and rendered lines.
+- Because of that, UIA line movement must use UIA line semantics and must not rely only on stable document length or raw newline characters.
 
 ## Text Snapshot Semantics
 
@@ -64,7 +67,7 @@ Fields printed by the watcher:
 - `text_source`: where text came from, such as `win32_edit` or `uia_text_pattern`
 - `document_len_utf16`: whole-document UTF-16 length
 - `selection utf16=(start, end)`: whole-document selection offsets
-- `line_index`: logical line index starting at `0`
+- `line_index`: current line index starting at `0`; for UIA this follows `TextUnit_Line`
 - `line_cursor_utf16`: cursor offset within the current line in UTF-16 units
 - `line_cursor_chars`: cursor offset within the current line in Rust `char` units
 - `line_text`: current visible line text
@@ -96,6 +99,6 @@ cargo run -- --interval-ms 150
 ## Working Notes
 
 - Prefer preserving the current trigger rule: do not fire during typing
-- Be careful when changing UIA behavior; visible wrapped lines and logical lines are not the same thing
+- Be careful when changing UIA behavior; UIA lines, visible wrapped lines, Markdown-rendered lines, and raw newline-delimited lines are not always the same thing
 - When changing watcher behavior, add or update unit tests in `src/platform/windows.rs`
 - The current IME switch function is still a stub and intentionally returns `not implemented`

@@ -1,5 +1,21 @@
 # smart-shift
 
+## Current watcher behavior
+
+The Windows watcher emits snapshots for focus relocation and cursor relocation, while suppressing ordinary text edits.
+
+Current text sources:
+
+- Win32 `Edit/RichEdit`
+- Windows UI Automation `TextPattern`
+
+Trigger notes:
+
+- Typing, deleting, and IME commits normally change `document_len_utf16`, so they are treated as edits and suppressed.
+- For `uia_text_pattern`, moving between UIA lines can change `document_len_utf16` in editors such as Obsidian because UIA may expose rendered Markdown differently from the raw document text.
+- Because of that, UIA cursor movement emits when `line_index` changes even if `document_len_utf16` changes.
+- UIA `line_index`, `line_cursor_utf16`, and `line_cursor_chars` are based on UI Automation `TextUnit_Line`, not on newline characters in `DocumentRange.GetText()`.
+
 `smart-shift` 是一个准备运行在 Windows 上的输入法自动切换工具。
 
 当前仓库分成两层：
