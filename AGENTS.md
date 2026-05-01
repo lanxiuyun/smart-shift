@@ -104,4 +104,4 @@ cargo run -- --interval-ms 150
 - Prefer preserving the current trigger rule: do not fire during typing
 - Be careful when changing UIA behavior; UIA lines, visible wrapped lines, Markdown-rendered lines, and raw newline-delimited lines are not always the same thing
 - When changing watcher behavior, add or update unit tests in `src/platform/windows.rs`
-- The current IME switch function is still a stub and intentionally returns `not implemented`
+- The current IME switch path toggles IMM open status on the focused control; treat that as the minimum viable implementation, not a full IME integration

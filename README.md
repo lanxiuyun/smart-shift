@@ -18,6 +18,9 @@ Trigger notes:
 - If UIA reports cursor offset `0` for a line that differs from the last newline-delimited line in the document prefix, the watcher uses that prefix line as the current line. If UIA has normalized line breaks to spaces, this fallback is skipped.
 - If UIA reports a blank line at cursor offset `0`, the watcher uses the previous non-empty line for classification so trailing newline boundaries inherit the preceding line context.
 - Each emitted supported text snapshot also prints the classifier result as `target_mode` and `reason`.
+- Each emitted snapshot also prints `current_ime_mode=chinese|english|unknown`, derived from `ImmGetOpenStatus` on the focused control.
+- In listener mode, when `current_ime_mode` is known and differs from `target_mode`, the watcher now attempts an automatic IMM-based mode switch and prints the switch result.
+- `cargo run -- --line "hello 中文" --cursor 0 --apply` now switches the focused control's IMM open status: Chinese opens IME, English closes it.
 
 `smart-shift` 是一个准备运行在 Windows 上的输入法自动切换工具。
 
@@ -72,6 +75,8 @@ cargo run -- --interval-ms 150
 - caret 所在窗口句柄
 - caret 矩形位置
 - 如果能读取当前文本，还会输出读取来源、文档长度、当前行文本、选区位置、当前行序号、行内光标位置
+- 如果能读取当前输入法状态，还会输出 `current_ime_mode=chinese|english|unknown`
+- 如果当前输入法状态可读且与 `target_mode` 不一致，监听模式还会尝试自动切换，并输出切换结果
 - 如果读取失败，会输出每一层读取策略的失败原因
 
 当前监听行为：
@@ -82,9 +87,9 @@ cargo run -- --interval-ms 150
 
 更完整的内部说明和协作约定见 `AGENTS.md`。
 
-这个模式的目标是先确认 Windows 监听链路是通的。它现在还不会：
+这个模式的目标仍然是先确认 Windows 监听链路是通的。它现在还不会：
 
-- 自动切换系统输入法
+- 可靠验证不同输入法上的真实切换结果
 
 当前文本抓取会按顺序尝试：
 

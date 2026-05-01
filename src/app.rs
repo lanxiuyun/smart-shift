@@ -84,6 +84,13 @@ impl fmt::Display for AppError {
 
 impl Error for AppError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyOutcome {
+    Applied,
+    SkippedAlreadyMatched,
+    SkippedUnknownCurrentMode,
+}
+
 pub fn run(args: CliArgs) -> Result<(), AppError> {
     if args.listen || args.line.is_empty() {
         return run_listener(args.interval_ms);
@@ -94,13 +101,16 @@ pub fn run(args: CliArgs) -> Result<(), AppError> {
     let decision = classify(&context);
 
     print_decision(&context, decision.mode, &decision.reason);
+    print_current_ime_mode();
 
     if args.apply {
         let controller = WindowsImeController::new();
-        controller
-            .switch_to(decision.mode)
+        let before_mode = controller.current_mode().ok();
+        let apply_outcome = maybe_apply_mode(&controller, before_mode, decision.mode)
             .map_err(AppError::Platform)?;
-        println!("applied=true");
+        print_apply_outcome(apply_outcome);
+        print_ime_mode_result("ime_mode_before_apply", before_mode);
+        print_ime_mode_result("ime_mode_after_apply", controller.current_mode().ok());
     } else {
         println!("applied=false");
     }
@@ -118,4 +128,79 @@ fn print_decision(context: &LineContext, mode: InputMode, reason: &DecisionReaso
     println!("cursor={}", context.cursor());
     println!("target_mode={mode}");
     println!("reason={reason}");
+}
+
+fn print_current_ime_mode() {
+    let controller = WindowsImeController::new();
+    match controller.current_mode() {
+        Ok(mode) => println!("current_ime_mode={mode}"),
+        Err(error) => {
+            println!("current_ime_mode=unknown");
+            println!("ime_read_error={error}");
+        }
+    }
+}
+
+fn print_ime_mode_result(label: &str, mode: Option<InputMode>) {
+    match mode {
+        Some(mode) => println!("{label}={mode}"),
+        None => println!("{label}=unknown"),
+    }
+}
+
+fn maybe_apply_mode(
+    controller: &WindowsImeController,
+    current_mode: Option<InputMode>,
+    target_mode: InputMode,
+) -> Result<ApplyOutcome, String> {
+    match current_mode {
+        Some(mode) if mode == target_mode => Ok(ApplyOutcome::SkippedAlreadyMatched),
+        Some(_) => {
+            controller.switch_to(target_mode)?;
+            Ok(ApplyOutcome::Applied)
+        }
+        None => Ok(ApplyOutcome::SkippedUnknownCurrentMode),
+    }
+}
+
+fn print_apply_outcome(outcome: ApplyOutcome) {
+    match outcome {
+        ApplyOutcome::Applied => {
+            println!("applied=true");
+            println!("apply_reason=mode_changed");
+        }
+        ApplyOutcome::SkippedAlreadyMatched => {
+            println!("applied=false");
+            println!("apply_reason=already_matched");
+        }
+        ApplyOutcome::SkippedUnknownCurrentMode => {
+            println!("applied=false");
+            println!("apply_reason=current_mode_unknown");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApplyOutcome, maybe_apply_mode};
+    use crate::ime::InputMode;
+    use crate::platform::windows::WindowsImeController;
+
+    #[test]
+    fn skips_apply_when_mode_already_matches() {
+        let controller = WindowsImeController::new();
+
+        let outcome = maybe_apply_mode(&controller, Some(InputMode::Chinese), InputMode::Chinese);
+
+        assert_eq!(outcome, Ok(ApplyOutcome::SkippedAlreadyMatched));
+    }
+
+    #[test]
+    fn skips_apply_when_current_mode_is_unknown() {
+        let controller = WindowsImeController::new();
+
+        let outcome = maybe_apply_mode(&controller, None, InputMode::English);
+
+        assert_eq!(outcome, Ok(ApplyOutcome::SkippedUnknownCurrentMode));
+    }
 }
