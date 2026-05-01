@@ -376,8 +376,16 @@ fn uia_range_to_line_snapshot(
     let line_text = unsafe { line_range.GetText(-1)? }.to_string();
     let document_text = unsafe { document_range.GetText(-1)? }.to_string();
     let document_prefix_text = unsafe { document_prefix.GetText(-1)? }.to_string();
-    let line_index = count_lines_before_cursor(&document_prefix_text);
-    let line_prefix_text = text_after_last_line_break(&document_prefix_text);
+    let line_index = uia_line_index(document_range, &line_range)?;
+    let line_prefix = unsafe { line_range.Clone()? };
+    unsafe {
+        line_prefix.MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            selected_range,
+            TextPatternRangeEndpoint_Start,
+        )?
+    };
+    let line_prefix_text = unsafe { line_prefix.GetText(-1)? }.to_string();
     let document_len_utf16 = document_text.encode_utf16().count();
     let selection_start_utf16 = document_prefix_text.encode_utf16().count();
     let selection_end_utf16 = selection_start_utf16;
@@ -397,30 +405,38 @@ fn uia_range_to_line_snapshot(
     })
 }
 
-fn count_lines_before_cursor(text: &str) -> usize {
-    let mut lines = 0usize;
-    let mut chars = text.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\r' => {
-                if matches!(chars.peek(), Some('\n')) {
-                    chars.next();
-                }
-                lines += 1;
-            }
-            '\n' => lines += 1,
-            _ => {}
-        }
+fn uia_line_index(
+    document_range: &IUIAutomationTextRange,
+    line_range: &IUIAutomationTextRange,
+) -> Result<usize, windows::core::Error> {
+    let walker = unsafe { document_range.Clone()? };
+    unsafe {
+        walker.MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            document_range,
+            TextPatternRangeEndpoint_Start,
+        )?;
+        walker.ExpandToEnclosingUnit(TextUnit_Line)?;
     }
 
-    lines
-}
+    let mut line_index = 0usize;
+    loop {
+        let comparison = unsafe {
+            walker.CompareEndpoints(
+                TextPatternRangeEndpoint_Start,
+                line_range,
+                TextPatternRangeEndpoint_Start,
+            )?
+        };
+        if comparison >= 0 {
+            return Ok(line_index);
+        }
 
-fn text_after_last_line_break(text: &str) -> &str {
-    match text.rfind(['\n', '\r']) {
-        Some(index) => &text[index + 1..],
-        None => text,
+        let moved = unsafe { walker.Move(TextUnit_Line, 1)? };
+        if moved == 0 {
+            return Ok(line_index);
+        }
+        line_index += moved as usize;
     }
 }
 
@@ -653,9 +669,7 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ForegroundSnapshot, TextReadAttempt, TextSnapshot, utf16_units_to_char_index,
-    };
+    use super::{ForegroundSnapshot, TextReadAttempt, TextSnapshot, utf16_units_to_char_index};
 
     fn snapshot(line_text: &str) -> ForegroundSnapshot {
         ForegroundSnapshot {
