@@ -16,6 +16,14 @@ use windows::Win32::UI::Accessibility::{
     TextUnit_Line, UIA_TextPatternId,
 };
 
+const STYLE_RESET: &str = "\x1b[0m";
+const STYLE_BOLD: &str = "\x1b[1m";
+const COLOR_DIM: &str = "\x1b[2m";
+const COLOR_RED: &str = "\x1b[31m";
+const COLOR_GREEN: &str = "\x1b[32m";
+const COLOR_YELLOW: &str = "\x1b[33m";
+const COLOR_CYAN: &str = "\x1b[36m";
+
 pub struct WindowsImeController;
 
 impl WindowsImeController {
@@ -36,25 +44,32 @@ impl WindowsImeController {
 
 pub struct ForegroundWatcher {
     interval: Duration,
+    debug: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenerSwitchOutcome {
+enum WatcherSwitchOutcome {
     Applied,
     SkippedAlreadyMatched,
     SkippedUnknownCurrentMode,
 }
 
 impl ForegroundWatcher {
-    pub fn new(interval_ms: u64) -> Self {
+    pub fn new(interval_ms: u64, debug: bool) -> Self {
         Self {
             interval: Duration::from_millis(interval_ms.max(50)),
+            debug,
         }
     }
 
     pub fn run(&self) -> Result<(), String> {
-        println!("listener_started=true");
-        println!("poll_interval_ms={}", self.interval.as_millis());
+        println!(
+            "{}smart-shift watcher started{}  polling={}ms  debug={}",
+            STYLE_BOLD,
+            STYLE_RESET,
+            self.interval.as_millis(),
+            self.debug
+        );
 
         let mut last_snapshot: Option<ForegroundSnapshot> = None;
         let mut last_error: Option<String> = None;
@@ -65,13 +80,14 @@ impl ForegroundWatcher {
                     last_error = None;
                     let should_emit = should_emit_snapshot(last_snapshot.as_ref(), &snapshot);
                     if should_emit {
-                        print_snapshot(&snapshot);
+                        print_snapshot(&snapshot, self.debug);
                     }
                     last_snapshot = Some(snapshot);
                 }
                 Err(error) => {
                     if last_error.as_ref() != Some(&error) {
-                        println!("listener_warning={error}");
+                        println!();
+                        println!("{}! watcher warning:{} {error}", COLOR_RED, STYLE_RESET);
                         last_error = Some(error);
                     }
                 }
@@ -93,8 +109,6 @@ fn should_emit_snapshot(
         || previous.foreground_title != current.foreground_title
         || previous.focus_hwnd != current.focus_hwnd
         || previous.focus_class != current.focus_class
-        || previous.ime_mode != current.ime_mode
-        || previous.ime_error != current.ime_error
     {
         return true;
     }
@@ -117,9 +131,8 @@ fn should_emit_snapshot(
     }
 
     if previous_text.document_len_utf16 != current_text.document_len_utf16 {
-        return previous_text.source == "uia_text_pattern"
-            && current_text.source == "uia_text_pattern"
-            && previous_text.line_index != current_text.line_index;
+        return previous_text.line_index != current_text.line_index
+            && (cursor_changed || caret_changed);
     }
 
     if previous_text.line_text != current_text.line_text {
@@ -264,13 +277,24 @@ fn resolve_ime_target_hwnd(foreground_hwnd: HWND, focus_hwnd: HWND) -> HWND {
 
 fn read_ime_mode(target_hwnd: HWND) -> Result<InputMode, String> {
     let is_open = read_ime_open_status(target_hwnd)?;
-    Ok(input_mode_from_open_status(is_open))
+    if !is_open {
+        return Ok(InputMode::English);
+    }
+
+    match read_ime_conversion_status_via_default_window(target_hwnd)
+        .or_else(|_| read_ime_conversion_status(target_hwnd))
+    {
+        Ok(conversion_mode) => Ok(input_mode_from_conversion_status(conversion_mode)),
+        Err(_) => Ok(InputMode::Chinese),
+    }
 }
 
 fn write_ime_mode(target_hwnd: HWND, mode: InputMode) -> Result<(), String> {
     let desired_open = ime_open_status_for_mode(mode);
+    let desired_conversion_mode = ime_conversion_status_for_mode(mode);
+    let mut last_error = None;
 
-    if let Ok(()) = with_ime_context(target_hwnd, |himc| {
+    match with_ime_context(target_hwnd, |himc| {
         let set_ok = unsafe { ImmSetOpenStatus(himc, desired_open as i32) };
         if set_ok == 0 {
             return Err(format!(
@@ -281,10 +305,54 @@ fn write_ime_mode(target_hwnd: HWND, mode: InputMode) -> Result<(), String> {
 
         Ok(())
     }) {
-        return Ok(());
+        Ok(()) => {
+            if verify_ime_mode(target_hwnd, mode).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(error) => last_error = Some(error),
     }
 
-    write_ime_open_status_via_default_window(target_hwnd, desired_open)
+    match write_ime_conversion_status_via_default_window(target_hwnd, desired_conversion_mode) {
+        Ok(()) => {
+            if verify_ime_mode(target_hwnd, mode).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(error) => last_error = Some(error),
+    }
+
+    match write_ime_conversion_status(target_hwnd, desired_conversion_mode) {
+        Ok(()) => {
+            if verify_ime_mode(target_hwnd, mode).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(error) => last_error = Some(error),
+    }
+
+    match write_ime_open_status_via_default_window(target_hwnd, desired_open) {
+        Ok(()) => {
+            if verify_ime_mode(target_hwnd, mode).is_ok() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "IME mode verification failed after WM_IME_CONTROL for hwnd=0x{:X}",
+                    target_hwnd as isize
+                ))
+            }
+        }
+        Err(error) => {
+            if verify_ime_mode(target_hwnd, mode).is_ok() {
+                Ok(())
+            } else {
+                let context = last_error
+                    .map(|previous| format!("; previous_error={previous}"))
+                    .unwrap_or_default();
+                Err(format!("{error}{context}"))
+            }
+        }
+    }
 }
 
 fn read_ime_open_status(target_hwnd: HWND) -> Result<bool, String> {
@@ -340,6 +408,106 @@ fn write_ime_open_status_via_default_window(
     Ok(())
 }
 
+fn read_ime_conversion_status_via_default_window(target_hwnd: HWND) -> Result<Dword, String> {
+    let default_ime_hwnd = unsafe { ImmGetDefaultIMEWnd(target_hwnd) };
+    if default_ime_hwnd.is_null() {
+        return Err(format!(
+            "ImmGetDefaultIMEWnd returned null for hwnd=0x{:X}",
+            target_hwnd as isize
+        ));
+    }
+
+    let result =
+        unsafe { SendMessageW(default_ime_hwnd, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0) };
+    Ok(result as Dword)
+}
+
+fn write_ime_conversion_status_via_default_window(
+    target_hwnd: HWND,
+    desired_conversion_mode: Dword,
+) -> Result<(), String> {
+    let default_ime_hwnd = unsafe { ImmGetDefaultIMEWnd(target_hwnd) };
+    if default_ime_hwnd.is_null() {
+        return Err(format!(
+            "ImmGetDefaultIMEWnd returned null for hwnd=0x{:X}",
+            target_hwnd as isize
+        ));
+    }
+
+    let result = unsafe {
+        SendMessageW(
+            default_ime_hwnd,
+            WM_IME_CONTROL,
+            IMC_SETCONVERSIONMODE,
+            desired_conversion_mode as LPARAM,
+        )
+    };
+    if result == 0 {
+        return Err(format!(
+            "WM_IME_CONTROL IMC_SETCONVERSIONMODE failed for hwnd=0x{:X}",
+            target_hwnd as isize
+        ));
+    }
+
+    Ok(())
+}
+
+fn read_ime_conversion_status(target_hwnd: HWND) -> Result<Dword, String> {
+    with_ime_context(target_hwnd, |himc| {
+        let mut conversion = 0u32;
+        let mut sentence = 0u32;
+        let ok = unsafe { ImmGetConversionStatus(himc, &mut conversion, &mut sentence) };
+        if ok == 0 {
+            return Err(format!(
+                "ImmGetConversionStatus failed for hwnd=0x{:X}",
+                target_hwnd as isize
+            ));
+        }
+
+        Ok(conversion)
+    })
+}
+
+fn write_ime_conversion_status(
+    target_hwnd: HWND,
+    desired_conversion_mode: Dword,
+) -> Result<(), String> {
+    with_ime_context(target_hwnd, |himc| {
+        let mut conversion = 0u32;
+        let mut sentence = 0u32;
+        let get_ok = unsafe { ImmGetConversionStatus(himc, &mut conversion, &mut sentence) };
+        if get_ok == 0 {
+            return Err(format!(
+                "ImmGetConversionStatus failed for hwnd=0x{:X}",
+                target_hwnd as isize
+            ));
+        }
+
+        let next_conversion =
+            (conversion & !IME_CMODE_NATIVE) | (desired_conversion_mode & IME_CMODE_NATIVE);
+        let set_ok = unsafe { ImmSetConversionStatus(himc, next_conversion, sentence) };
+        if set_ok == 0 {
+            return Err(format!(
+                "ImmSetConversionStatus failed for hwnd=0x{:X}",
+                target_hwnd as isize
+            ));
+        }
+
+        Ok(())
+    })
+}
+
+fn verify_ime_mode(target_hwnd: HWND, expected_mode: InputMode) -> Result<(), String> {
+    match read_ime_mode(target_hwnd) {
+        Ok(mode) if mode == expected_mode => Ok(()),
+        Ok(mode) => Err(format!(
+            "IME mode verification failed for hwnd=0x{:X}: expected={expected_mode} actual={mode}",
+            target_hwnd as isize
+        )),
+        Err(error) => Err(format!("IME mode verification read failed: {error}")),
+    }
+}
+
 fn with_ime_context<T, F>(target_hwnd: HWND, operation: F) -> Result<T, String>
 where
     F: FnOnce(*mut c_void) -> Result<T, String>,
@@ -371,8 +539,24 @@ fn ime_open_status_for_mode(mode: InputMode) -> bool {
     }
 }
 
+fn ime_conversion_status_for_mode(mode: InputMode) -> Dword {
+    match mode {
+        InputMode::Chinese => IME_CMODE_NATIVE,
+        InputMode::English => 0,
+    }
+}
+
+#[cfg(test)]
 fn input_mode_from_open_status(is_open: bool) -> InputMode {
     if is_open {
+        InputMode::Chinese
+    } else {
+        InputMode::English
+    }
+}
+
+fn input_mode_from_conversion_status(conversion_mode: Dword) -> InputMode {
+    if conversion_mode & IME_CMODE_NATIVE != 0 {
         InputMode::Chinese
     } else {
         InputMode::English
@@ -615,68 +799,121 @@ fn uia_line_index(
     }
 }
 
-fn print_snapshot(snapshot: &ForegroundSnapshot) {
-    println!(
-        "window hwnd=0x{:X} thread_id={} title={}",
-        snapshot.foreground_hwnd, snapshot.thread_id, snapshot.foreground_title
-    );
-    println!(
-        "focus hwnd=0x{:X} class={}",
-        snapshot.focus_hwnd, snapshot.focus_class
-    );
-    match snapshot.ime_mode {
-        Some(mode) => println!("current_ime_mode={mode}"),
-        None => println!("current_ime_mode=unknown"),
+fn print_snapshot(snapshot: &ForegroundSnapshot, debug: bool) {
+    println!();
+    println!("{}smart-shift event{}", STYLE_BOLD, STYLE_RESET);
+
+    if debug {
+        println!(
+            "{}Window{}   0x{:X}  thread={}  title=\"{}\"",
+            COLOR_DIM,
+            STYLE_RESET,
+            snapshot.foreground_hwnd,
+            snapshot.thread_id,
+            snapshot.foreground_title
+        );
+        println!(
+            "{}Focus{}    0x{:X}  class={}",
+            COLOR_DIM, STYLE_RESET, snapshot.focus_hwnd, snapshot.focus_class
+        );
+        if let Some(error) = &snapshot.ime_error {
+            println!("{}IME read error{} {error}", COLOR_DIM, STYLE_RESET);
+        }
+        println!(
+            "{}Caret{}    hwnd=0x{:X}  rect=({}, {}, {}, {})",
+            COLOR_DIM,
+            STYLE_RESET,
+            snapshot.caret_hwnd,
+            snapshot.caret_left,
+            snapshot.caret_top,
+            snapshot.caret_right,
+            snapshot.caret_bottom
+        );
     }
-    if let Some(error) = &snapshot.ime_error {
-        println!("ime_read_error={error}");
-    }
-    println!(
-        "caret hwnd=0x{:X} rect=({}, {}, {}, {})",
-        snapshot.caret_hwnd,
-        snapshot.caret_left,
-        snapshot.caret_top,
-        snapshot.caret_right,
-        snapshot.caret_bottom
-    );
 
     if snapshot.text_snapshot.source != "unsupported" {
         let edit = &snapshot.text_snapshot;
-        println!("text_source={}", edit.source);
         println!(
-            "document_len_utf16={} selection utf16=({}, {}) line_index={} line_cursor_utf16={} line_cursor_chars={}",
-            edit.document_len_utf16,
-            edit.selection_start_utf16,
-            edit.selection_end_utf16,
-            edit.line_index,
-            edit.line_cursor_utf16,
-            edit.line_cursor_chars
+            "{}Line{}     \"{}\"",
+            COLOR_CYAN, STYLE_RESET, edit.line_text
         );
-        println!("line_text={}", edit.line_text);
-        print_snapshot_decision(edit);
-    } else {
-        println!("line_text=unsupported");
-        for attempt in &snapshot.text_snapshot.attempts {
+
+        if debug {
             println!(
-                "text_attempt source={} result={}",
-                attempt.source,
-                attempt.result.as_str()
+                "{}Text{}     source={}  doc_len_utf16={}  selection=({}, {})",
+                COLOR_DIM,
+                STYLE_RESET,
+                edit.source,
+                edit.document_len_utf16,
+                edit.selection_start_utf16,
+                edit.selection_end_utf16,
             );
+            println!(
+                "{}         line={}  cursor_utf16={}  cursor_chars={}{}",
+                COLOR_DIM,
+                edit.line_index,
+                edit.line_cursor_utf16,
+                edit.line_cursor_chars,
+                STYLE_RESET
+            );
+        }
+
+        print_snapshot_decision(edit, snapshot.ime_mode, debug);
+    } else {
+        println!("{}Line{}     unsupported", COLOR_YELLOW, STYLE_RESET);
+        println!(
+            "{}Switch{}   skipped  reason=text_unsupported",
+            COLOR_YELLOW, STYLE_RESET
+        );
+        if debug {
+            for attempt in &snapshot.text_snapshot.attempts {
+                println!(
+                    "{}         attempt source={} result={}{}",
+                    COLOR_DIM,
+                    attempt.source,
+                    attempt.result.as_str(),
+                    STYLE_RESET
+                );
+            }
         }
     }
 }
 
-fn print_snapshot_decision(snapshot: &TextSnapshot) {
+fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMode>, debug: bool) {
     match classify_snapshot(snapshot) {
         Ok(decision) => {
-            println!("target_mode={}", decision.mode);
-            println!("reason={}", decision.reason);
-            print_listener_switch(decision.mode);
+            println!(
+                "{}IME{}      current={}  target={}",
+                COLOR_CYAN,
+                STYLE_RESET,
+                format_mode(current_mode),
+                format_mode(Some(decision.mode))
+            );
+            if debug {
+                println!(
+                    "{}Decision{} reason={}",
+                    COLOR_DIM, STYLE_RESET, decision.reason
+                );
+            }
+            print_watcher_switch(decision.mode);
         }
         Err((cursor, text_len)) => {
-            println!("classification=unavailable cursor={cursor} text_len={text_len}");
-            println!("switch_attempted=false");
-            println!("switch_reason=classification_unavailable");
+            println!(
+                "{}IME{}      current={}  target=unknown",
+                COLOR_CYAN,
+                STYLE_RESET,
+                format_mode(current_mode)
+            );
+            if debug {
+                println!(
+                    "{}Decision{} unavailable  cursor={cursor}  text_len={text_len}",
+                    COLOR_DIM, STYLE_RESET
+                );
+            }
+            println!(
+                "{}Switch{}   skipped  reason=classification_unavailable",
+                COLOR_YELLOW, STYLE_RESET
+            );
         }
     }
 }
@@ -686,54 +923,91 @@ fn classify_snapshot(snapshot: &TextSnapshot) -> Result<Decision, (usize, usize)
     Ok(classify(&context))
 }
 
-fn print_listener_switch(target_mode: InputMode) {
+fn print_watcher_switch(target_mode: InputMode) {
     let controller = WindowsImeController::new();
     let current_mode = controller.current_mode().ok();
 
-    match maybe_switch_listener_mode(&controller, current_mode, target_mode) {
+    match maybe_switch_watcher_mode(&controller, current_mode, target_mode) {
         Ok(outcome) => {
+            let switch_summary = match outcome {
+                WatcherSwitchOutcome::Applied => "applied  reason=mode_changed",
+                WatcherSwitchOutcome::SkippedAlreadyMatched => "skipped  reason=already_matched",
+                WatcherSwitchOutcome::SkippedUnknownCurrentMode => {
+                    "skipped  reason=current_mode_unknown"
+                }
+            };
+
             match outcome {
-                ListenerSwitchOutcome::Applied => {
-                    println!("switch_attempted=true");
-                    println!("switch_reason=mode_changed");
+                WatcherSwitchOutcome::Applied
+                | WatcherSwitchOutcome::SkippedAlreadyMatched
+                | WatcherSwitchOutcome::SkippedUnknownCurrentMode => {
+                    match controller.current_mode() {
+                        Ok(mode) => println!(
+                            "{}Switch{}   {switch_summary}  after={}",
+                            switch_color(outcome),
+                            STYLE_RESET,
+                            format_mode(Some(mode))
+                        ),
+                        Err(error) => {
+                            println!(
+                                "{}Switch{}   {switch_summary}  after=unknown",
+                                COLOR_YELLOW, STYLE_RESET
+                            );
+                            println!("{}         read_error={error}{}", COLOR_DIM, STYLE_RESET);
+                        }
+                    }
                 }
-                ListenerSwitchOutcome::SkippedAlreadyMatched => {
-                    println!("switch_attempted=false");
-                    println!("switch_reason=already_matched");
-                }
-                ListenerSwitchOutcome::SkippedUnknownCurrentMode => {
-                    println!("switch_attempted=false");
-                    println!("switch_reason=current_mode_unknown");
-                }
-            }
-            match controller.current_mode() {
-                Ok(mode) => println!("ime_mode_after_switch={mode}"),
-                Err(error) => {
-                    println!("ime_mode_after_switch=unknown");
-                    println!("ime_switch_read_error={error}");
-                }
-            }
+            };
         }
         Err(error) => {
-            println!("switch_attempted=true");
-            println!("switch_reason=apply_failed");
-            println!("ime_switch_error={error}");
+            match controller.current_mode() {
+                Ok(mode) => println!(
+                    "{}Switch{}   failed  reason=apply_failed  after={}",
+                    COLOR_RED,
+                    STYLE_RESET,
+                    format_mode(Some(mode))
+                ),
+                Err(error) => {
+                    println!(
+                        "{}Switch{}   failed  reason=apply_failed  after=unknown",
+                        COLOR_RED, STYLE_RESET
+                    );
+                    println!("{}         read_error={error}{}", COLOR_DIM, STYLE_RESET);
+                }
+            }
+            println!("{}         switch_error={error}{}", COLOR_DIM, STYLE_RESET);
         }
     }
 }
 
-fn maybe_switch_listener_mode(
+fn format_mode(mode: Option<InputMode>) -> String {
+    match mode {
+        Some(InputMode::Chinese) => format!("{COLOR_GREEN}chinese{STYLE_RESET}"),
+        Some(InputMode::English) => format!("{COLOR_CYAN}english{STYLE_RESET}"),
+        None => format!("{COLOR_YELLOW}unknown{STYLE_RESET}"),
+    }
+}
+
+fn switch_color(outcome: WatcherSwitchOutcome) -> &'static str {
+    match outcome {
+        WatcherSwitchOutcome::Applied => COLOR_GREEN,
+        WatcherSwitchOutcome::SkippedAlreadyMatched
+        | WatcherSwitchOutcome::SkippedUnknownCurrentMode => COLOR_YELLOW,
+    }
+}
+
+fn maybe_switch_watcher_mode(
     controller: &WindowsImeController,
     current_mode: Option<InputMode>,
     target_mode: InputMode,
-) -> Result<ListenerSwitchOutcome, String> {
+) -> Result<WatcherSwitchOutcome, String> {
     match current_mode {
-        Some(mode) if mode == target_mode => Ok(ListenerSwitchOutcome::SkippedAlreadyMatched),
+        Some(mode) if mode == target_mode => Ok(WatcherSwitchOutcome::SkippedAlreadyMatched),
         Some(_) => {
             controller.switch_to(target_mode)?;
-            Ok(ListenerSwitchOutcome::Applied)
+            Ok(WatcherSwitchOutcome::Applied)
         }
-        None => Ok(ListenerSwitchOutcome::SkippedUnknownCurrentMode),
+        None => Ok(WatcherSwitchOutcome::SkippedUnknownCurrentMode),
     }
 }
 
@@ -871,8 +1145,11 @@ const EM_GETLINE: UINT = 0x00C4;
 const EM_LINEFROMCHAR: UINT = 0x00C9;
 const EM_LINEINDEX: UINT = 0x00BB;
 const EM_LINELENGTH: UINT = 0x00C1;
+const IMC_GETCONVERSIONMODE: WPARAM = 0x0001;
+const IMC_SETCONVERSIONMODE: WPARAM = 0x0002;
 const IMC_GETOPENSTATUS: WPARAM = 0x0005;
 const IMC_SETOPENSTATUS: WPARAM = 0x0006;
+const IME_CMODE_NATIVE: Dword = 0x0001;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -929,15 +1206,22 @@ unsafe extern "system" {
     fn ImmGetDefaultIMEWnd(hWnd: HWND) -> HWND;
     fn ImmGetContext(hWnd: HWND) -> *mut c_void;
     fn ImmGetOpenStatus(hIMC: *mut c_void) -> Bool;
+    fn ImmGetConversionStatus(
+        hIMC: *mut c_void,
+        lpfdwConversion: *mut Dword,
+        lpfdwSentence: *mut Dword,
+    ) -> Bool;
     fn ImmReleaseContext(hWnd: HWND, hIMC: *mut c_void) -> Bool;
+    fn ImmSetConversionStatus(hIMC: *mut c_void, fdwConversion: Dword, fdwSentence: Dword) -> Bool;
     fn ImmSetOpenStatus(hIMC: *mut c_void, fOpen: Bool) -> Bool;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundSnapshot, ListenerSwitchOutcome, TextReadAttempt, TextSnapshot,
-        ime_open_status_for_mode, input_mode_from_open_status, maybe_switch_listener_mode,
+        ForegroundSnapshot, IME_CMODE_NATIVE, TextReadAttempt, TextSnapshot, WatcherSwitchOutcome,
+        ime_conversion_status_for_mode, ime_open_status_for_mode,
+        input_mode_from_conversion_status, input_mode_from_open_status, maybe_switch_watcher_mode,
         resolve_ime_target_hwnd, utf16_units_to_char_index,
     };
     use crate::ime::InputMode;
@@ -1030,22 +1314,22 @@ mod tests {
     }
 
     #[test]
-    fn emits_for_ime_mode_change() {
+    fn ignores_ime_mode_change_without_relocation() {
         let previous = snapshot("abc");
         let mut current = snapshot("abc");
         current.ime_mode = Some(InputMode::Chinese);
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert!(!super::should_emit_snapshot(Some(&previous), &current));
     }
 
     #[test]
-    fn emits_for_ime_error_change() {
+    fn ignores_ime_error_change_without_relocation() {
         let previous = snapshot("abc");
         let mut current = snapshot("abc");
         current.ime_mode = None;
         current.ime_error = Some("ImmGetContext returned null".to_string());
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert!(!super::should_emit_snapshot(Some(&previous), &current));
     }
 
     #[test]
@@ -1119,6 +1403,22 @@ mod tests {
     }
 
     #[test]
+    fn emits_for_line_change_even_when_document_length_changes() {
+        let previous = snapshot("first line");
+        let mut current = snapshot("second line");
+        current.text_snapshot.document_len_utf16 = previous.text_snapshot.document_len_utf16 + 1;
+        current.text_snapshot.line_index = 1;
+        current.text_snapshot.selection_start_utf16 = 11;
+        current.text_snapshot.selection_end_utf16 = 11;
+        current.text_snapshot.line_cursor_utf16 = 0;
+        current.text_snapshot.line_cursor_chars = 0;
+        current.caret_top = 40;
+        current.caret_bottom = 50;
+
+        assert!(super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
     fn emits_uia_line_move_when_document_length_changes() {
         let previous = uia_snapshot("  ## PasteDrop");
         let mut current = uia_snapshot("publish to juejin, linux do, hello github, ruan");
@@ -1183,6 +1483,19 @@ mod tests {
     }
 
     #[test]
+    fn chinese_mode_sets_native_conversion() {
+        assert_eq!(
+            ime_conversion_status_for_mode(InputMode::Chinese),
+            IME_CMODE_NATIVE
+        );
+    }
+
+    #[test]
+    fn english_mode_clears_native_conversion() {
+        assert_eq!(ime_conversion_status_for_mode(InputMode::English), 0);
+    }
+
+    #[test]
     fn open_status_true_maps_to_chinese_mode() {
         assert_eq!(input_mode_from_open_status(true), InputMode::Chinese);
     }
@@ -1190,6 +1503,19 @@ mod tests {
     #[test]
     fn open_status_false_maps_to_english_mode() {
         assert_eq!(input_mode_from_open_status(false), InputMode::English);
+    }
+
+    #[test]
+    fn native_conversion_maps_to_chinese_mode() {
+        assert_eq!(
+            input_mode_from_conversion_status(IME_CMODE_NATIVE),
+            InputMode::Chinese
+        );
+    }
+
+    #[test]
+    fn non_native_conversion_maps_to_english_mode() {
+        assert_eq!(input_mode_from_conversion_status(0), InputMode::English);
     }
 
     #[test]
@@ -1208,24 +1534,21 @@ mod tests {
     }
 
     #[test]
-    fn listener_skips_switch_when_mode_already_matches() {
+    fn watcher_skips_switch_when_mode_already_matches() {
         let controller = super::WindowsImeController::new();
 
-        let outcome = maybe_switch_listener_mode(
-            &controller,
-            Some(InputMode::Chinese),
-            InputMode::Chinese,
-        );
+        let outcome =
+            maybe_switch_watcher_mode(&controller, Some(InputMode::Chinese), InputMode::Chinese);
 
-        assert_eq!(outcome, Ok(ListenerSwitchOutcome::SkippedAlreadyMatched));
+        assert_eq!(outcome, Ok(WatcherSwitchOutcome::SkippedAlreadyMatched));
     }
 
     #[test]
-    fn listener_skips_switch_when_current_mode_is_unknown() {
+    fn watcher_skips_switch_when_current_mode_is_unknown() {
         let controller = super::WindowsImeController::new();
 
-        let outcome = maybe_switch_listener_mode(&controller, None, InputMode::English);
+        let outcome = maybe_switch_watcher_mode(&controller, None, InputMode::English);
 
-        assert_eq!(outcome, Ok(ListenerSwitchOutcome::SkippedUnknownCurrentMode));
+        assert_eq!(outcome, Ok(WatcherSwitchOutcome::SkippedUnknownCurrentMode));
     }
 }

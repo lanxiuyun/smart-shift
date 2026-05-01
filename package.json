@@ -3,6 +3,6 @@
     "test": "cargo test",
     "dev": "cargo run",
     "cli": "cargo run --",
-    "listen": "cargo run -- --listen"
+    "watch": "cargo run -- --watch"
   }
 }

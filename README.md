@@ -1,110 +1,159 @@
 # smart-shift
 
-## Current watcher behavior
+`smart-shift` is a Windows-first input method switching tool. It watches the active text input location, classifies the current cursor context as Chinese or English, and switches the IME mode when the cursor moves to a context that needs a different mode.
 
-The Windows watcher emits snapshots for focus relocation and cursor relocation, while suppressing ordinary text edits.
+## Current Status
 
-Current text sources:
+Implemented:
+
+- Context-based Chinese/English classifier
+- One-shot CLI classification for test input
+- Background foreground watcher prototype
+- Win32 `Edit/RichEdit` text snapshot reading
+- UI Automation `TextPattern` text snapshot reading
+- Trigger filtering for cursor relocation vs. text editing
+- Compact colored watcher output, with extra diagnostics behind `--debug`
+- IMM/default-IME-window based IME mode read and switch
+- Default IME window conversion-mode fallback for IMEs such as Microsoft Pinyin
+- Automatic mode switch when the watcher emits a supported text snapshot and `current_ime_mode` differs from `target_mode`
+
+Not implemented yet:
+
+- True Windows resident service behavior
+- App-specific adapters beyond the current placeholders
+- Robust cross-IME verification beyond the current IMM-based path
+
+## Recent Changes
+
+This iteration focused on making the watcher match the intended background behavior:
+
+- Renamed the long-running command path to background watcher terminology.
+- Added `--watch` for explicit watcher mode; plain `cargo run` still starts the watcher when no one-shot `--line` is provided.
+- Added `--debug` for verbose watcher diagnostics.
+- Removed IME mode/read-error changes from the emit condition, so manual `Shift` toggles do not trigger re-evaluation by themselves.
+- Allowed line changes to emit even when `document_len_utf16` changes, as long as the line index and cursor/selection/caret moved.
+- Compacted default terminal output to line text, current IME mode, target IME mode, and switch result.
+- Added ANSI color output for watcher summaries.
+- Improved Microsoft Pinyin support by reading and writing conversion mode through the default IME window before falling back to direct HIMC conversion status and open status.
+
+## Background Watcher Behavior
+
+The watcher polls the foreground state on an interval. It should process cursor or focus relocation, while suppressing ordinary text edits.
+
+Should trigger:
+
+- Foreground window changed
+- Focused input control changed
+- Cursor moved within the same input control
+- Selection changed within the same input control
+- Mouse click moved the insertion point
+- Long wrapped text moved to another visible line while document length stayed the same
+- Cursor moved to another line even if the reported document length changes
+- UIA editor cursor moved to another UIA line, even if the reported document length changes
+
+Should not trigger:
+
+- Typing characters
+- Deleting characters
+- IME commit that changes document length without a line relocation
+- Manual IME mode toggle by itself, such as pressing `Shift`
+
+Current decision rule:
+
+- If `document_len_utf16` changed, normally treat it as editing and do not emit.
+- Exception: if `line_index` changed and the cursor, selection, or caret also moved, treat it as cursor relocation and emit.
+- If document length stayed the same and selection, cursor, caret, or visible line changed, emit.
+- IME mode changes are diagnostics only; they do not trigger a watcher emission.
+
+## Text Sources
+
+Current text snapshot sources:
 
 - Win32 `Edit/RichEdit`
 - Windows UI Automation `TextPattern`
 
-Trigger notes:
+For Win32 `Edit/RichEdit`, `line_index` is based on the control's logical line APIs.
 
-- Typing, deleting, and IME commits normally change `document_len_utf16`, so they are treated as edits and suppressed.
-- For `uia_text_pattern`, moving between UIA lines can change `document_len_utf16` in editors such as Obsidian because UIA may expose rendered Markdown differently from the raw document text.
-- Because of that, UIA cursor movement emits when `line_index` changes even if `document_len_utf16` changes.
-- UIA `line_index`, `line_cursor_utf16`, and `line_cursor_chars` are based on UI Automation `TextUnit_Line`, not on newline characters in `DocumentRange.GetText()`.
-- If UIA reports cursor offset `0` for a line that differs from the last newline-delimited line in the document prefix, the watcher uses that prefix line as the current line. If UIA has normalized line breaks to spaces, this fallback is skipped.
-- If UIA reports a blank line at cursor offset `0`, the watcher uses the previous non-empty line for classification so trailing newline boundaries inherit the preceding line context.
-- Each emitted supported text snapshot also prints the classifier result as `target_mode` and `reason`.
-- Each emitted snapshot also prints `current_ime_mode=chinese|english|unknown`, derived from `ImmGetOpenStatus` on the focused control.
-- In listener mode, when `current_ime_mode` is known and differs from `target_mode`, the watcher now attempts an automatic IMM-based mode switch and prints the switch result.
-- `cargo run -- --line "hello 中文" --cursor 0 --apply` now switches the focused control's IMM open status: Chinese opens IME, English closes it.
-- Known issue: manual `Shift` IME toggles currently cause a new watcher emission because `ime_mode` changes are treated as observable state changes.
-- Known issue: weak-signal lines such as blank UIA placeholders may classify as `target_mode=english` with `reason=default_english`, which can cause an unwanted auto-switch back to English.
-- Planned fix: if the user manually toggles IME mode with `Shift` and remains in the same input control, automatic switching should stay paused until the user clicks or focuses a different input control.
+For UIA `TextPattern`, `line_index`, `line_cursor_utf16`, and `line_cursor_chars` are based on UI Automation `TextUnit_Line`, not raw newline characters in `DocumentRange.GetText()`. This matters for Electron/Chromium/UIA editors such as Obsidian, where UIA may expose rendered Markdown lines and report document length changes when moving between source-like and rendered lines.
 
-`smart-shift` 是一个准备运行在 Windows 上的输入法自动切换工具。
+## Watcher Output
 
-当前仓库分成两层：
+By default, each emitted supported text snapshot prints only the important runtime decision:
 
-- 规则层：根据一行文本和光标位置，判断应该切到中文还是英文
-- 平台层：监听 Windows 前台窗口和 caret，后续再接真实文本抓取与输入法切换
+- Current line text
+- Current IME mode
+- Target IME mode
+- Switch result
 
-## 当前已实现
+Example compact output:
 
-- Rust 项目骨架
-- 中英文上下文判定逻辑
-- 命令行模式验证判定结果
-- Windows 监听雏形：轮询前台窗口和 caret 位置变化
-
-## 判定模式
-
-运行：
-
-```powershell
-cargo run -- --line "hello 中文" --cursor 0
-cargo run -- --line "hello 中文" --cursor 6
+```text
+smart-shift event
+Line     "aaa example"
+IME      current=english  target=chinese
+Switch   applied  reason=mode_changed  after=chinese
 ```
 
-规则：
+With `--debug`, the watcher also prints detailed diagnostics:
 
-- 光标所在字符是中文，优先中文
-- 光标所在字符是英文，优先英文
-- 光标落在空格、括号、标点等位置时，向两侧找最近的有效语言信号
-- 没有明显信号时，默认英文
+- `text_source`
+- window/focus/caret details
+- `ime_read_error`, when mode reading fails
+- `document_len_utf16`
+- `selection utf16=(start, end)`
+- `line_index`
+- `line_cursor_utf16`
+- `line_cursor_chars`
+- classifier `reason`
+- switch errors
 
-## Windows 监听雏形
+Weak-signal lines such as blank UIA placeholders may classify as `target_mode=english` with `reason=default_english`, which can cause an unwanted auto-switch back to English.
 
-运行：
+## IME Switching Notes
+
+Microsoft Pinyin can report and apply Chinese/English state through conversion mode rather than only IMM open status. The current switch path is:
+
+- Read/write default IME window conversion mode: `IMC_GETCONVERSIONMODE` / `IMC_SETCONVERSIONMODE`.
+- Fall back to direct HIMC conversion status: `ImmGetConversionStatus` / `ImmSetConversionStatus`.
+- Fall back to IMM open status: `ImmGetOpenStatus` / `ImmSetOpenStatus`.
+- Fall back to default IME window open status: `IMC_GETOPENSTATUS` / `IMC_SETOPENSTATUS`.
+- Read back the final state after each write and treat the switch as successful if verification reaches the target mode.
+
+## Usage
+
+Run the background watcher:
 
 ```powershell
 cargo run
 ```
 
-可选轮询间隔：
+Run the background watcher with an explicit polling interval:
 
 ```powershell
-cargo run -- --interval-ms 150
+cargo run -- --watch --interval-ms 150
 ```
 
-当前会持续输出：
+Run the background watcher with debug diagnostics:
 
-- 前台窗口句柄
-- 前台窗口标题
-- 当前聚焦控件句柄和类名
-- GUI 线程 id
-- caret 所在窗口句柄
-- caret 矩形位置
-- 如果能读取当前文本，还会输出读取来源、文档长度、当前行文本、选区位置、当前行序号、行内光标位置
-- 如果能读取当前输入法状态，还会输出 `current_ime_mode=chinese|english|unknown`
-- 如果当前输入法状态可读且与 `target_mode` 不一致，监听模式还会尝试自动切换，并输出切换结果
-- 如果读取失败，会输出每一层读取策略的失败原因
+```powershell
+cargo run -- --watch --debug --interval-ms 150
+```
 
-当前监听行为：
+Run one-shot classification:
 
-- 只在窗口切换、焦点切换、光标移动、选区变化、鼠标点击重定位时输出
-- 输入、删除、上屏这类会改变文本长度的编辑过程不会触发
-- 对长文本自动折行场景，会结合文档长度和光标偏移判断，而不是只依赖逻辑行号
+```powershell
+cargo run -- --line "hello world" --cursor 0
+cargo run -- --line "hello world" --cursor 6
+```
 
-更完整的内部说明和协作约定见 `AGENTS.md`。
+Apply one-shot classification to the focused control's IME mode:
 
-这个模式的目标仍然是先确认 Windows 监听链路是通的。它现在还不会：
+```powershell
+cargo run -- --line "hello world" --cursor 0 --apply
+```
 
-- 可靠验证不同输入法上的真实切换结果
+## Validation
 
-当前文本抓取会按顺序尝试：
-
-- Win32 `Edit/RichEdit`
-- Windows UI Automation `TextPattern`
-- 应用专用适配器
-
-对于浏览器、自绘编辑器、Electron、IDE 自定义文本区，能否读取取决于目标应用是否暴露 UI Automation 文本信息；如果不暴露，会显示 `line_text=unsupported` 和对应的 `text_attempt` 失败原因。
-
-## 下一步
-
-- 获取当前编辑控件文本和选区
-- 把 caret 位置映射到文本位置
-- 接入 Windows 输入法读取与切换 API
-- 做成后台常驻程序
+```powershell
+cargo test
+```

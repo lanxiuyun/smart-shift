@@ -10,7 +10,8 @@ pub struct CliArgs {
     pub line: String,
     pub cursor: usize,
     pub apply: bool,
-    pub listen: bool,
+    pub watch: bool,
+    pub debug: bool,
     pub interval_ms: u64,
 }
 
@@ -19,7 +20,8 @@ impl CliArgs {
         let mut line = String::new();
         let mut cursor = 0usize;
         let mut apply = false;
-        let mut listen = false;
+        let mut watch = false;
+        let mut debug = false;
         let mut interval_ms = 250u64;
 
         let mut args = env::args().skip(1);
@@ -37,8 +39,11 @@ impl CliArgs {
                 "--apply" => {
                     apply = true;
                 }
-                "--listen" => {
-                    listen = true;
+                "--watch" => {
+                    watch = true;
+                }
+                "--debug" => {
+                    debug = true;
                 }
                 "--interval-ms" => {
                     interval_ms = args
@@ -54,7 +59,8 @@ impl CliArgs {
             line,
             cursor,
             apply,
-            listen,
+            watch,
+            debug,
             interval_ms,
         }
     }
@@ -92,8 +98,8 @@ enum ApplyOutcome {
 }
 
 pub fn run(args: CliArgs) -> Result<(), AppError> {
-    if args.listen || args.line.is_empty() {
-        return run_listener(args.interval_ms);
+    if args.watch || args.line.is_empty() {
+        return run_background_watcher(args.interval_ms, args.debug);
     }
 
     let context = LineContext::new(args.line, args.cursor)
@@ -118,8 +124,8 @@ pub fn run(args: CliArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn run_listener(interval_ms: u64) -> Result<(), AppError> {
-    let watcher = ForegroundWatcher::new(interval_ms);
+fn run_background_watcher(interval_ms: u64, debug: bool) -> Result<(), AppError> {
+    let watcher = ForegroundWatcher::new(interval_ms, debug);
     watcher.run().map_err(AppError::Platform)
 }
 
