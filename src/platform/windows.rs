@@ -50,10 +50,11 @@ impl ForegroundWatcher {
             match capture_foreground_snapshot() {
                 Ok(snapshot) => {
                     last_error = None;
-                    if last_snapshot.as_ref() != Some(&snapshot) {
+                    let should_emit = should_emit_snapshot(last_snapshot.as_ref(), &snapshot);
+                    if should_emit {
                         print_snapshot(&snapshot);
-                        last_snapshot = Some(snapshot);
                     }
+                    last_snapshot = Some(snapshot);
                 }
                 Err(error) => {
                     if last_error.as_ref() != Some(&error) {
@@ -65,6 +66,50 @@ impl ForegroundWatcher {
             thread::sleep(self.interval);
         }
     }
+}
+
+fn should_emit_snapshot(
+    previous: Option<&ForegroundSnapshot>,
+    current: &ForegroundSnapshot,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+
+    if previous.foreground_hwnd != current.foreground_hwnd
+        || previous.foreground_title != current.foreground_title
+        || previous.focus_hwnd != current.focus_hwnd
+        || previous.focus_class != current.focus_class
+    {
+        return true;
+    }
+
+    let previous_text = &previous.text_snapshot;
+    let current_text = &current.text_snapshot;
+    let cursor_changed = previous_text.selection_start_utf16 != current_text.selection_start_utf16
+        || previous_text.selection_end_utf16 != current_text.selection_end_utf16
+        || previous_text.line_index != current_text.line_index
+        || previous_text.line_cursor_utf16 != current_text.line_cursor_utf16
+        || previous_text.line_cursor_chars != current_text.line_cursor_chars;
+    let caret_changed = previous.caret_hwnd != current.caret_hwnd
+        || previous.caret_left != current.caret_left
+        || previous.caret_top != current.caret_top
+        || previous.caret_right != current.caret_right
+        || previous.caret_bottom != current.caret_bottom;
+
+    if previous_text.source != current_text.source {
+        return true;
+    }
+
+    if previous_text.document_len_utf16 != current_text.document_len_utf16 {
+        return false;
+    }
+
+    if previous_text.line_text != current_text.line_text {
+        return cursor_changed || caret_changed;
+    }
+
+    cursor_changed || caret_changed
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +130,7 @@ struct ForegroundSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TextSnapshot {
     source: &'static str,
+    document_len_utf16: usize,
     selection_start_utf16: usize,
     selection_end_utf16: usize,
     line_index: usize,
@@ -196,6 +242,7 @@ fn capture_text_snapshot(hwnd: HWND, class_name: &str) -> TextSnapshot {
 
     TextSnapshot {
         source: "unsupported",
+        document_len_utf16: 0,
         selection_start_utf16: 0,
         selection_end_utf16: 0,
         line_index: 0,
@@ -241,9 +288,14 @@ fn capture_win32_edit_text(hwnd: HWND, class_name: &str) -> Result<TextSnapshot,
         Some(value) => value,
         None => return Err(TextReadResult::Failed("cursor_utf16_to_char_failed")),
     };
+    let document_len_utf16 = match window_text_utf16(hwnd) {
+        Some(value) => value.len(),
+        None => return Err(TextReadResult::Failed("document_length_read_failed")),
+    };
 
     Ok(TextSnapshot {
         source: "win32_edit",
+        document_len_utf16,
         selection_start_utf16,
         selection_end_utf16,
         line_index,
@@ -284,7 +336,8 @@ fn read_uia_text(hwnd: HWND) -> Result<TextSnapshot, windows::core::Error> {
         }
 
         let selected_range = selection.GetElement(0)?;
-        uia_range_to_line_snapshot(&selected_range)
+        let document_range = pattern.DocumentRange()?;
+        uia_range_to_line_snapshot(&document_range, &selected_range)
     };
 
     if com_initialized {
@@ -305,14 +358,15 @@ fn focused_uia_element(
 }
 
 fn uia_range_to_line_snapshot(
+    document_range: &IUIAutomationTextRange,
     selected_range: &IUIAutomationTextRange,
 ) -> Result<TextSnapshot, windows::core::Error> {
     let line_range = unsafe { selected_range.Clone()? };
     unsafe { line_range.ExpandToEnclosingUnit(TextUnit_Line)? };
 
-    let cursor_prefix = unsafe { line_range.Clone()? };
+    let document_prefix = unsafe { document_range.Clone()? };
     unsafe {
-        cursor_prefix.MoveEndpointByRange(
+        document_prefix.MoveEndpointByRange(
             TextPatternRangeEndpoint_End,
             selected_range,
             TextPatternRangeEndpoint_Start,
@@ -320,20 +374,54 @@ fn uia_range_to_line_snapshot(
     };
 
     let line_text = unsafe { line_range.GetText(-1)? }.to_string();
-    let cursor_text = unsafe { cursor_prefix.GetText(-1)? }.to_string();
-    let line_cursor_chars = cursor_text.chars().count();
-    let line_cursor_utf16 = cursor_text.encode_utf16().count();
+    let document_text = unsafe { document_range.GetText(-1)? }.to_string();
+    let document_prefix_text = unsafe { document_prefix.GetText(-1)? }.to_string();
+    let line_index = count_lines_before_cursor(&document_prefix_text);
+    let line_prefix_text = text_after_last_line_break(&document_prefix_text);
+    let document_len_utf16 = document_text.encode_utf16().count();
+    let selection_start_utf16 = document_prefix_text.encode_utf16().count();
+    let selection_end_utf16 = selection_start_utf16;
+    let line_prefix_utf16 = line_prefix_text.encode_utf16().count();
+    let line_prefix_chars = line_prefix_text.chars().count();
 
     Ok(TextSnapshot {
         source: "uia_text_pattern",
-        selection_start_utf16: line_cursor_utf16,
-        selection_end_utf16: line_cursor_utf16,
-        line_index: 0,
-        line_cursor_utf16,
-        line_cursor_chars,
+        document_len_utf16,
+        selection_start_utf16,
+        selection_end_utf16,
+        line_index,
+        line_cursor_utf16: line_prefix_utf16,
+        line_cursor_chars: line_prefix_chars,
         line_text,
         attempts: Vec::new(),
     })
+}
+
+fn count_lines_before_cursor(text: &str) -> usize {
+    let mut lines = 0usize;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if matches!(chars.peek(), Some('\n')) {
+                    chars.next();
+                }
+                lines += 1;
+            }
+            '\n' => lines += 1,
+            _ => {}
+        }
+    }
+
+    lines
+}
+
+fn text_after_last_line_break(text: &str) -> &str {
+    match text.rfind(['\n', '\r']) {
+        Some(index) => &text[index + 1..],
+        None => text,
+    }
 }
 
 fn print_snapshot(snapshot: &ForegroundSnapshot) {
@@ -358,7 +446,8 @@ fn print_snapshot(snapshot: &ForegroundSnapshot) {
         let edit = &snapshot.text_snapshot;
         println!("text_source={}", edit.source);
         println!(
-            "selection utf16=({}, {}) line_index={} line_cursor_utf16={} line_cursor_chars={}",
+            "document_len_utf16={} selection utf16=({}, {}) line_index={} line_cursor_utf16={} line_cursor_chars={}",
+            edit.document_len_utf16,
             edit.selection_start_utf16,
             edit.selection_end_utf16,
             edit.line_index,
@@ -564,7 +653,35 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::utf16_units_to_char_index;
+    use super::{
+        ForegroundSnapshot, TextReadAttempt, TextSnapshot, utf16_units_to_char_index,
+    };
+
+    fn snapshot(line_text: &str) -> ForegroundSnapshot {
+        ForegroundSnapshot {
+            foreground_hwnd: 1,
+            foreground_title: "title".to_string(),
+            thread_id: 1,
+            focus_hwnd: 2,
+            focus_class: "Edit".to_string(),
+            caret_hwnd: 3,
+            caret_left: 10,
+            caret_top: 20,
+            caret_right: 11,
+            caret_bottom: 30,
+            text_snapshot: TextSnapshot {
+                source: "win32_edit",
+                document_len_utf16: line_text.encode_utf16().count(),
+                selection_start_utf16: 0,
+                selection_end_utf16: 0,
+                line_index: 0,
+                line_cursor_utf16: 0,
+                line_cursor_chars: 0,
+                line_text: line_text.to_string(),
+                attempts: Vec::<TextReadAttempt>::new(),
+            },
+        }
+    }
 
     #[test]
     fn utf16_offsets_match_ascii_char_count() {
@@ -579,5 +696,112 @@ mod tests {
         assert_eq!(utf16_units_to_char_index(&data, 1), Some(1));
         assert_eq!(utf16_units_to_char_index(&data, 2), Some(2));
         assert_eq!(utf16_units_to_char_index(&data, 4), Some(3));
+    }
+
+    #[test]
+    fn ignores_plain_text_changes() {
+        let previous = snapshot("abc");
+        let mut current = snapshot("abcd");
+        current.text_snapshot.selection_start_utf16 = 1;
+        current.text_snapshot.selection_end_utf16 = 1;
+        current.text_snapshot.line_cursor_utf16 = 1;
+        current.text_snapshot.line_cursor_chars = 1;
+        current.caret_left = 20;
+        current.caret_right = 21;
+
+        assert!(!super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn emits_for_cursor_move_without_text_change() {
+        let previous = snapshot("abc");
+        let mut current = snapshot("abc");
+        current.text_snapshot.selection_start_utf16 = 1;
+        current.text_snapshot.selection_end_utf16 = 1;
+        current.text_snapshot.line_cursor_utf16 = 1;
+        current.text_snapshot.line_cursor_chars = 1;
+        current.caret_left = 20;
+        current.caret_right = 21;
+
+        assert!(super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn emits_for_focus_change() {
+        let previous = snapshot("abc");
+        let mut current = snapshot("xyz");
+        current.focus_hwnd = 99;
+
+        assert!(super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn emits_cursor_move_after_suppressed_text_change_when_baseline_updates() {
+        let previous = snapshot("abc");
+        let mut typed = snapshot("abcd");
+        typed.text_snapshot.selection_start_utf16 = 1;
+        typed.text_snapshot.selection_end_utf16 = 1;
+        typed.text_snapshot.line_cursor_utf16 = 1;
+        typed.text_snapshot.line_cursor_chars = 1;
+        assert!(!super::should_emit_snapshot(Some(&previous), &typed));
+
+        let mut moved = typed.clone();
+        moved.text_snapshot.selection_start_utf16 = 2;
+        moved.text_snapshot.selection_end_utf16 = 2;
+        moved.text_snapshot.line_cursor_utf16 = 2;
+        moved.text_snapshot.line_cursor_chars = 2;
+        moved.caret_left = 30;
+        moved.caret_right = 31;
+
+        assert!(super::should_emit_snapshot(Some(&typed), &moved));
+    }
+
+    #[test]
+    fn emits_when_cursor_moves_to_another_line_with_different_text() {
+        let previous = snapshot("first line");
+        let mut current = snapshot("second line");
+        current.text_snapshot.document_len_utf16 = previous.text_snapshot.document_len_utf16;
+        current.text_snapshot.line_index = 1;
+        current.text_snapshot.selection_start_utf16 = 3;
+        current.text_snapshot.selection_end_utf16 = 3;
+        current.text_snapshot.line_cursor_utf16 = 3;
+        current.text_snapshot.line_cursor_chars = 3;
+        current.caret_top = 40;
+        current.caret_bottom = 50;
+
+        assert!(super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn emits_for_wrapped_line_move_when_document_length_is_unchanged() {
+        let previous = snapshot("wrapped line segment a");
+        let mut current = snapshot("wrapped line segment b");
+        current.text_snapshot.selection_start_utf16 = 124;
+        current.text_snapshot.selection_end_utf16 = 124;
+        current.text_snapshot.line_cursor_utf16 = 54;
+        current.text_snapshot.line_cursor_chars = 54;
+        current.text_snapshot.document_len_utf16 = previous.text_snapshot.document_len_utf16;
+
+        let mut previous = previous;
+        previous.text_snapshot.selection_start_utf16 = 122;
+        previous.text_snapshot.selection_end_utf16 = 122;
+        previous.text_snapshot.line_cursor_utf16 = 52;
+        previous.text_snapshot.line_cursor_chars = 52;
+
+        assert!(super::should_emit_snapshot(Some(&previous), &current));
+    }
+
+    #[test]
+    fn still_ignores_same_line_text_edits() {
+        let previous = snapshot("abc");
+        let mut current = snapshot("abcd");
+        current.text_snapshot.selection_start_utf16 = 4;
+        current.text_snapshot.selection_end_utf16 = 4;
+        current.text_snapshot.line_cursor_utf16 = 4;
+        current.text_snapshot.line_cursor_chars = 4;
+        current.caret_left = 40;
+        current.caret_right = 41;
+
+        assert!(!super::should_emit_snapshot(Some(&previous), &current));
     }
 }
