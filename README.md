@@ -15,6 +15,8 @@ Trigger notes:
 - For `uia_text_pattern`, moving between UIA lines can change `document_len_utf16` in editors such as Obsidian because UIA may expose rendered Markdown differently from the raw document text.
 - Because of that, UIA cursor movement emits when `line_index` changes even if `document_len_utf16` changes.
 - UIA `line_index`, `line_cursor_utf16`, and `line_cursor_chars` are based on UI Automation `TextUnit_Line`, not on newline characters in `DocumentRange.GetText()`.
+- If UIA reports cursor offset `0` for a line that differs from the last newline-delimited line in the document prefix, the watcher uses that prefix line as the current line. If UIA has normalized line breaks to spaces, this fallback is skipped.
+- If UIA reports a blank line at cursor offset `0`, the watcher uses the previous non-empty line for classification so trailing newline boundaries inherit the preceding line context.
 - Each emitted supported text snapshot also prints the classifier result as `target_mode` and `reason`.
 
 `smart-shift` 是一个准备运行在 Windows 上的输入法自动切换工具。
@@ -30,6 +32,9 @@ Trigger notes:
 这是一串中文字符（鼠标光标点击/移动到这里的时候，变成中文）中文中文中文
 
 这是一串中文字符中文中文中文， 中文中文this is english english (鼠标光标点击这里时候，变成英文)english
+
+## PasteDrop(光标在这，获取 ## paste....)
+(光标在这，获取 发布文章到....)发布文章到掘金，linux do，hello github，阮一峰
 ```
 然后输入的过程中不会触发，换行的长文本也要支持
 只有用户用方向键移动光标，切到另一个输入框的文本，同一输入框里点击别的位置
