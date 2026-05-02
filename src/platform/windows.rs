@@ -4,11 +4,13 @@ use crate::ime::InputMode;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use windows::Win32::Foundation::{
-    HWND as WinHwnd, LPARAM as WinLparam, LRESULT as WinLresult, POINT, WPARAM as WinWparam,
+    ERROR_ALREADY_EXISTS, GetLastError, HWND as WinHwnd, LPARAM as WinLparam,
+    LRESULT as WinLresult, POINT, WPARAM as WinWparam,
 };
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::Com::{
@@ -27,9 +29,11 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
-    LoadIconW, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    LoadIconW, MB_ICONERROR, MB_OK, MF_STRING, MSG, MessageBoxW, PostQuitMessage,
+    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA,
+    GetWindowLongPtrW, WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::PCWSTR;
 
@@ -41,6 +45,7 @@ const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_YELLOW: &str = "\x1b[33m";
 const COLOR_CYAN: &str = "\x1b[36m";
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
+const TRAY_TOGGLE_COMMAND_ID: usize = 1000;
 const TRAY_EXIT_COMMAND_ID: usize = 1001;
 const TRAY_WINDOW_CLASS: &str = "smart_shift_tray_window";
 
@@ -52,9 +57,73 @@ enum AppAdapter {
 pub struct WindowsTray {
     hwnd: WinHwnd,
     icon_data: NOTIFYICONDATAW,
+    runtime_ptr: *const TrayRuntimeControl,
 }
 
 pub struct WindowsImeController;
+
+pub struct WindowsSingleInstance {
+    handle: HANDLE,
+}
+
+pub struct TrayRuntimeControl {
+    stop_requested: AtomicBool,
+    paused: AtomicBool,
+}
+
+impl TrayRuntimeControl {
+    pub fn new() -> Self {
+        Self {
+            stop_requested: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+        }
+    }
+
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn toggle_paused(&self) -> bool {
+        let new_state = !self.is_paused();
+        self.paused.store(new_state, Ordering::Relaxed);
+        new_state
+    }
+}
+
+impl WindowsSingleInstance {
+    pub fn acquire(name: &str) -> Result<Self, String> {
+        let mutex_name = wide_null(name);
+        let handle = unsafe { CreateMutexW(null_mut(), 0, PCWSTR(mutex_name.as_ptr())) };
+        if handle.is_null() {
+            return Err(format!("CreateMutexW failed: {}", unsafe { GetLastError().0 }));
+        }
+        let last_error = unsafe { GetLastError() };
+        if last_error == ERROR_ALREADY_EXISTS {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err("smart-shift is already running".to_string());
+        }
+
+        Ok(Self { handle })
+    }
+}
+
+impl Drop for WindowsSingleInstance {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
 
 impl WindowsImeController {
     pub fn new() -> Self {
@@ -107,6 +176,62 @@ impl ForegroundWatcher {
         self.run_until(|| stop_signal.load(Ordering::Relaxed))
     }
 
+    pub fn run_until_controlled(&self, control: &TrayRuntimeControl) -> Result<(), String> {
+        println!(
+            "{}smart-shift watcher started{}  polling={}ms  debug={}",
+            STYLE_BOLD,
+            STYLE_RESET,
+            self.interval.as_millis(),
+            self.debug
+        );
+
+        let mut last_snapshot: Option<ForegroundSnapshot> = None;
+        let mut last_error: Option<String> = None;
+        let mut suppressed_text_edit = false;
+        let mut was_paused = false;
+
+        while !control.stop_requested() {
+            if control.is_paused() {
+                was_paused = true;
+                thread::sleep(self.interval);
+                continue;
+            }
+
+            if was_paused {
+                last_snapshot = None;
+                last_error = None;
+                suppressed_text_edit = false;
+                was_paused = false;
+            }
+
+            match capture_foreground_snapshot() {
+                Ok(snapshot) => {
+                    last_error = None;
+                    let transition = classify_snapshot_transition_with_state(
+                        last_snapshot.as_ref(),
+                        &snapshot,
+                        suppressed_text_edit,
+                    );
+                    if transition == SnapshotTransition::Emit {
+                        print_snapshot(&snapshot, self.debug);
+                    }
+                    suppressed_text_edit = transition == SnapshotTransition::SuppressedTextEdit;
+                    last_snapshot = Some(snapshot);
+                }
+                Err(error) => {
+                    if last_error.as_ref() != Some(&error) {
+                        println!();
+                        println!("{}! watcher warning:{} {error}", COLOR_RED, STYLE_RESET);
+                        last_error = Some(error);
+                    }
+                }
+            }
+            thread::sleep(self.interval);
+        }
+
+        Ok(())
+    }
+
     fn run_until<F>(&self, should_stop: F) -> Result<(), String>
     where
         F: Fn() -> bool,
@@ -154,11 +279,16 @@ impl ForegroundWatcher {
 }
 
 impl WindowsTray {
-    pub fn new(title: &str, tooltip: &str) -> Result<Self, String> {
+    pub fn new(
+        title: &str,
+        tooltip: &str,
+        runtime: Arc<TrayRuntimeControl>,
+    ) -> Result<Self, String> {
         let instance = unsafe { GetModuleHandleW(None) }
             .map_err(|error| format!("GetModuleHandleW failed: {error}"))?;
         let class_name = wide_null(TRAY_WINDOW_CLASS);
         let title_text = wide_null(title);
+        let runtime_ptr = Arc::into_raw(runtime);
 
         let window_class = WNDCLASSW {
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }
@@ -188,10 +318,18 @@ impl WindowsTray {
                 None,
                 None,
                 Some(instance.into()),
-                None,
+                Some(runtime_ptr as *const c_void),
             )
-        }
-        .map_err(|error| format!("CreateWindowExW failed: {error}"))?;
+        };
+        let hwnd = match hwnd {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                unsafe {
+                    drop(Arc::from_raw(runtime_ptr));
+                }
+                return Err(format!("CreateWindowExW failed: {error}"));
+            }
+        };
 
         let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }
             .map_err(|error| format!("LoadIconW failed: {error}"))?;
@@ -204,7 +342,11 @@ impl WindowsTray {
             .ok()
             .map_err(|error| format!("Shell_NotifyIconW setversion failed: {error}"))?;
 
-        Ok(Self { hwnd, icon_data })
+        Ok(Self {
+            hwnd,
+            icon_data,
+            runtime_ptr,
+        })
     }
 
     pub fn run(self) -> Result<(), String> {
@@ -231,6 +373,7 @@ impl Drop for WindowsTray {
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.icon_data);
             let _ = DestroyWindow(self.hwnd);
+            drop(Arc::from_raw(self.runtime_ptr));
         }
     }
 }
@@ -268,19 +411,43 @@ unsafe extern "system" fn tray_window_proc(
     lparam: WinLparam,
 ) -> WinLresult {
     match message {
+        WM_NCCREATE => {
+            let create = lparam.0 as *const CREATESTRUCTW;
+            if let Some(create) = unsafe { create.as_ref() } {
+                unsafe {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+                }
+            }
+            WinLresult(1)
+        }
         TRAY_CALLBACK_MESSAGE => {
-            if lparam.0 as u32 == WM_RBUTTONUP {
-                let _ = show_tray_menu(hwnd);
+            let tray_event = tray_callback_event(lparam);
+            if tray_event == WM_RBUTTONUP || tray_event == WM_CONTEXTMENU || tray_event == WM_LBUTTONUP {
+                let _ = show_tray_menu(hwnd, unsafe { tray_runtime_from_hwnd(hwnd) });
             }
             WinLresult(0)
         }
         WM_COMMAND => {
-            if wparam.0 == TRAY_EXIT_COMMAND_ID {
+            let command_id = tray_command_id(wparam);
+
+            if command_id == TRAY_TOGGLE_COMMAND_ID {
+                if let Some(runtime) = unsafe { tray_runtime_from_hwnd(hwnd) } {
+                    runtime.toggle_paused();
+                }
+            }
+
+            if command_id == TRAY_EXIT_COMMAND_ID {
+                if let Some(runtime) = unsafe { tray_runtime_from_hwnd(hwnd) } {
+                    runtime.request_stop();
+                }
                 let _ = unsafe { DestroyWindow(hwnd) };
             }
             WinLresult(0)
         }
         WM_DESTROY => {
+            if let Some(runtime) = unsafe { tray_runtime_from_hwnd(hwnd) } {
+                runtime.request_stop();
+            }
             unsafe { PostQuitMessage(0) };
             WinLresult(0)
         }
@@ -288,10 +455,40 @@ unsafe extern "system" fn tray_window_proc(
     }
 }
 
-fn show_tray_menu(hwnd: WinHwnd) -> Result<(), String> {
+unsafe fn tray_runtime_from_hwnd(hwnd: WinHwnd) -> Option<&'static TrayRuntimeControl> {
+    let control_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const TrayRuntimeControl;
+    unsafe { control_ptr.as_ref() }
+}
+
+fn tray_command_id(wparam: WinWparam) -> usize {
+    wparam.0 & 0xFFFF
+}
+
+fn tray_callback_event(lparam: WinLparam) -> u32 {
+    (lparam.0 as usize & 0xFFFF) as u32
+}
+
+fn show_tray_menu(hwnd: WinHwnd, runtime: Option<&TrayRuntimeControl>) -> Result<(), String> {
     let menu =
         unsafe { CreatePopupMenu() }.map_err(|error| format!("CreatePopupMenu failed: {error}"))?;
+    let toggle_label = if runtime.is_some_and(TrayRuntimeControl::is_paused) {
+        wide_null("Resume")
+    } else {
+        wide_null("Pause")
+    };
     let exit_label = wide_null("Exit");
+
+    if let Err(error) = unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            TRAY_TOGGLE_COMMAND_ID,
+            PCWSTR(toggle_label.as_ptr()),
+        )
+    } {
+        let _ = unsafe { DestroyMenu(menu) };
+        return Err(format!("AppendMenuW failed: {error}"));
+    }
 
     if let Err(error) = unsafe {
         AppendMenuW(
@@ -334,6 +531,19 @@ fn show_tray_menu(hwnd: WinHwnd) -> Result<(), String> {
         return Err(format!("DestroyMenu failed: {error}"));
     }
     Ok(())
+}
+
+pub fn show_error_dialog(title: &str, message: &str) {
+    let title = wide_null(title);
+    let message = wide_null(message);
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
 }
 
 fn classify_snapshot_transition_with_state(
@@ -1638,6 +1848,11 @@ unsafe extern "system" {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn CreateMutexW(
+        lpMutexAttributes: *mut c_void,
+        bInitialOwner: Bool,
+        lpName: PCWSTR,
+    ) -> HANDLE;
     fn CloseHandle(hObject: HANDLE) -> Bool;
     fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> HANDLE;
     fn QueryFullProcessImageNameW(
@@ -1667,10 +1882,11 @@ unsafe extern "system" {
 mod tests {
     use super::{
         AppAdapter, ForegroundSnapshot, IME_CMODE_NATIVE, TextReadAttempt, TextSnapshot,
-        WatcherSwitchOutcome, app_adapter_for_context, ime_conversion_status_for_mode,
-        ime_open_status_for_mode, input_mode_from_conversion_status, input_mode_from_open_status,
+        TrayRuntimeControl, WatcherSwitchOutcome, app_adapter_for_context,
+        ime_conversion_status_for_mode, ime_open_status_for_mode,
+        input_mode_from_conversion_status, input_mode_from_open_status,
         maybe_switch_watcher_mode, normalize_uia_text_for_adapter, resolve_ime_target_hwnd,
-        utf16_units_to_char_index,
+        utf16_units_to_char_index, WinLparam, WinWparam, WM_LBUTTONUP, WM_RBUTTONUP,
     };
     use crate::ime::InputMode;
     use std::ptr::null_mut;
@@ -2202,5 +2418,36 @@ mod tests {
         let outcome = maybe_switch_watcher_mode(&controller, None, InputMode::English);
 
         assert_eq!(outcome, Ok(WatcherSwitchOutcome::SkippedUnknownCurrentMode));
+    }
+
+    #[test]
+    fn tray_runtime_control_toggles_pause_state() {
+        let control = TrayRuntimeControl::new();
+
+        assert!(!control.is_paused());
+        assert!(control.toggle_paused());
+        assert!(control.is_paused());
+        assert!(!control.toggle_paused());
+        assert!(!control.is_paused());
+    }
+
+    #[test]
+    fn tray_command_id_uses_low_word() {
+        assert_eq!(
+            super::tray_command_id(WinWparam(1001usize << 16 | 42usize)),
+            42
+        );
+    }
+
+    #[test]
+    fn tray_callback_event_uses_low_word() {
+        assert_eq!(
+            super::tray_callback_event(WinLparam((7isize << 16) | WM_RBUTTONUP as isize)),
+            WM_RBUTTONUP
+        );
+        assert_eq!(
+            super::tray_callback_event(WinLparam((3isize << 16) | WM_LBUTTONUP as isize)),
+            WM_LBUTTONUP
+        );
     }
 }

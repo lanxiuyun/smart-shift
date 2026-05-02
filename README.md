@@ -9,7 +9,9 @@ Implemented:
 - Context-based Chinese/English classifier
 - One-shot CLI classification for test input
 - Background foreground watcher prototype
-- Windows system tray demo with Exit menu
+- Windows GUI-subsystem tray app shell
+- Single-instance protection for tray mode
+- Windows system tray controls with Pause/Resume/Exit
 - Win32 `Edit/RichEdit` text snapshot reading
 - UI Automation `TextPattern` text snapshot reading
 - Chromium/Electron `Chrome_WidgetWin_1` UIA adapter with ghost-character cleanup
@@ -42,6 +44,9 @@ This iteration focused on making the watcher match the intended background behav
 - Wired up the first app adapter for Chromium/Electron `Chrome_WidgetWin_1`, reusing UIA but stripping common invisible ghost characters before classification and cursor accounting.
 - Narrowed adapter selection from control class alone to control class plus process name, so Chromium-hosted editors can be handled without matching every browser window.
 - Added a demo system tray mode: plain `cargo run` now starts the watcher in the background and keeps an Exit action in the Windows notification area.
+- Switched the Windows entry point to the GUI subsystem so the packaged app no longer depends on a visible console window.
+- Added single-instance protection for tray mode so repeated launches fail fast instead of starting multiple background watchers.
+- Expanded the tray menu from `Exit` to `Pause` / `Resume` / `Exit`.
 
 ## Background Watcher Behavior
 
@@ -137,6 +142,20 @@ Run the tray demo:
 ```powershell
 cargo run
 ```
+
+The tray mode now:
+
+- starts as a single background instance
+- exposes `Pause`, `Resume`, and `Exit` from the tray icon menu
+- shows a Windows error dialog if startup fails before the tray loop is running
+
+For day-to-day development on Windows, prefer:
+
+```powershell
+pnpm dev
+```
+
+That script builds `target\debug\smart-shift.exe`, copies it to a temp location, and launches the temp copy. This avoids Windows file-lock errors when the tray app is still running and Cargo tries to overwrite the debug executable on the next run.
 
 Or:
 

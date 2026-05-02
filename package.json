@@ -1,7 +1,7 @@
 {
   "scripts": {
     "test": "cargo test",
-    "dev": "cargo run",
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\dev-launch.ps1",
     "watch": "cargo run -- --watch",
     "classify": "cargo run --",
     "cli": "cargo run --"
