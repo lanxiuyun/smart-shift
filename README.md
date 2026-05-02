@@ -9,8 +9,10 @@ Implemented:
 - Context-based Chinese/English classifier
 - One-shot CLI classification for test input
 - Background foreground watcher prototype
+- Windows system tray demo with Exit menu
 - Win32 `Edit/RichEdit` text snapshot reading
 - UI Automation `TextPattern` text snapshot reading
+- Chromium/Electron `Chrome_WidgetWin_1` UIA adapter with ghost-character cleanup
 - Trigger filtering for cursor relocation vs. text editing
 - Compact colored watcher output, with extra diagnostics behind `--debug`
 - IMM/default-IME-window based IME mode read and switch
@@ -20,7 +22,7 @@ Implemented:
 Not implemented yet:
 
 - True Windows resident service behavior
-- App-specific adapters beyond the current placeholders
+- More app-specific adapters beyond the current Chromium/Electron path
 - Robust cross-IME verification beyond the current IMM-based path
 
 ## Recent Changes
@@ -28,7 +30,7 @@ Not implemented yet:
 This iteration focused on making the watcher match the intended background behavior:
 
 - Renamed the long-running command path to background watcher terminology.
-- Added `--watch` for explicit watcher mode; plain `cargo run` still starts the watcher when no one-shot `--line` is provided.
+- Added `--watch` for explicit console watcher mode, while plain `cargo run` now starts the tray demo when no one-shot `--line` is provided.
 - Added `--debug` for verbose watcher diagnostics.
 - Removed IME mode/read-error changes from the emit condition, so manual `Shift` toggles do not trigger re-evaluation by themselves.
 - Allowed line changes to emit even when `document_len_utf16` changes, as long as the line index and cursor/selection/caret moved.
@@ -36,7 +38,10 @@ This iteration focused on making the watcher match the intended background behav
 - Compacted default terminal output to line text, current IME mode, target IME mode, and switch result.
 - Added ANSI color output for watcher summaries.
 - Improved Microsoft Pinyin support by reading and writing conversion mode through the default IME window before falling back to direct HIMC conversion status and open status.
-- Preserved the current IME mode on blank lines when the classifier only has the weak `default_english` signal.
+- Preserved the current IME mode on weak-signal blank or placeholder-only UIA lines when the classifier only has the weak `default_english` signal.
+- Wired up the first app adapter for Chromium/Electron `Chrome_WidgetWin_1`, reusing UIA but stripping common invisible ghost characters before classification and cursor accounting.
+- Narrowed adapter selection from control class alone to control class plus process name, so Chromium-hosted editors can be handled without matching every browser window.
+- Added a demo system tray mode: plain `cargo run` now starts the watcher in the background and keeps an Exit action in the Windows notification area.
 
 ## Background Watcher Behavior
 
@@ -111,9 +116,9 @@ With `--debug`, the watcher also prints detailed diagnostics:
 - classifier `reason`
 - switch errors
 
-Weak-signal lines such as blank UIA placeholders may classify as `target_mode=english` with `reason=default_english`, which can cause an unwanted auto-switch back to English.
+Weak-signal lines such as blank or placeholder-only UIA text may classify as `target_mode=english` with `reason=default_english`, which can cause an unwanted auto-switch back to English.
 
-The watcher now treats a truly blank line with only a `default_english` signal as preserve-current-mode territory: it still reports the classifier result in debug context, but skips auto-switching and keeps the existing IME mode.
+The watcher now treats a blank line, or a UIA line made only of placeholder punctuation/symbols, with only a `default_english` signal as preserve-current-mode territory: it still reports the classifier result in debug context, but skips auto-switching and keeps the existing IME mode.
 
 ## IME Switching Notes
 
@@ -127,13 +132,19 @@ Microsoft Pinyin can report and apply Chinese/English state through conversion m
 
 ## Usage
 
-Run the background watcher:
+Run the tray demo:
 
 ```powershell
 cargo run
 ```
 
-Run the background watcher with an explicit polling interval:
+Or:
+
+```powershell
+pnpm dev
+```
+
+Run the background watcher in the console:
 
 ```powershell
 cargo run -- --watch --interval-ms 150

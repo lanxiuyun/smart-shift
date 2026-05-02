@@ -1,10 +1,13 @@
 use crate::classifier::{DecisionReason, classify};
 use crate::context::LineContext;
 use crate::ime::InputMode;
-use crate::platform::windows::{ForegroundWatcher, WindowsImeController};
+use crate::platform::windows::{ForegroundWatcher, WindowsImeController, WindowsTray};
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 pub struct CliArgs {
     pub line: String,
@@ -98,8 +101,12 @@ enum ApplyOutcome {
 }
 
 pub fn run(args: CliArgs) -> Result<(), AppError> {
-    if args.watch || args.line.is_empty() {
+    if args.watch {
         return run_background_watcher(args.interval_ms, args.debug);
+    }
+
+    if args.line.is_empty() {
+        return run_tray_demo(args.interval_ms, args.debug);
     }
 
     let context = LineContext::new(args.line, args.cursor)
@@ -127,6 +134,27 @@ pub fn run(args: CliArgs) -> Result<(), AppError> {
 fn run_background_watcher(interval_ms: u64, debug: bool) -> Result<(), AppError> {
     let watcher = ForegroundWatcher::new(interval_ms, debug);
     watcher.run().map_err(AppError::Platform)
+}
+
+fn run_tray_demo(interval_ms: u64, debug: bool) -> Result<(), AppError> {
+    let watcher = ForegroundWatcher::new(interval_ms, debug);
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let watcher_stop_signal = Arc::clone(&stop_signal);
+
+    let watcher_thread = thread::spawn(move || watcher.run_until_stopped(&watcher_stop_signal));
+
+    let tray_result = WindowsTray::new("smart-shift", "smart-shift is running")
+        .and_then(|tray| tray.run())
+        .map_err(AppError::Platform);
+
+    stop_signal.store(true, Ordering::Relaxed);
+
+    let watcher_result = watcher_thread
+        .join()
+        .map_err(|_| AppError::Platform("watcher thread panicked".to_string()))?;
+
+    tray_result?;
+    watcher_result.map_err(AppError::Platform)
 }
 
 fn print_decision(context: &LineContext, mode: InputMode, reason: &DecisionReason) {

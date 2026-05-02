@@ -4,17 +4,34 @@ use crate::ime::InputMode;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use windows::Win32::Foundation::HWND as WinHwnd;
+use windows::Win32::Foundation::{
+    HWND as WinHwnd, LPARAM as WinLparam, LRESULT as WinLresult, POINT, WPARAM as WinWparam,
+};
+use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
     IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
     TextUnit_Line, UIA_TextPatternId,
 };
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
+    LoadIconW, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+};
+use windows::core::PCWSTR;
 
 const STYLE_RESET: &str = "\x1b[0m";
 const STYLE_BOLD: &str = "\x1b[1m";
@@ -23,6 +40,19 @@ const COLOR_RED: &str = "\x1b[31m";
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_YELLOW: &str = "\x1b[33m";
 const COLOR_CYAN: &str = "\x1b[36m";
+const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
+const TRAY_EXIT_COMMAND_ID: usize = 1001;
+const TRAY_WINDOW_CLASS: &str = "smart_shift_tray_window";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppAdapter {
+    ChromiumUia,
+}
+
+pub struct WindowsTray {
+    hwnd: WinHwnd,
+    icon_data: NOTIFYICONDATAW,
+}
 
 pub struct WindowsImeController;
 
@@ -70,6 +100,17 @@ impl ForegroundWatcher {
     }
 
     pub fn run(&self) -> Result<(), String> {
+        self.run_until(|| false)
+    }
+
+    pub fn run_until_stopped(&self, stop_signal: &AtomicBool) -> Result<(), String> {
+        self.run_until(|| stop_signal.load(Ordering::Relaxed))
+    }
+
+    fn run_until<F>(&self, should_stop: F) -> Result<(), String>
+    where
+        F: Fn() -> bool,
+    {
         println!(
             "{}smart-shift watcher started{}  polling={}ms  debug={}",
             STYLE_BOLD,
@@ -82,7 +123,7 @@ impl ForegroundWatcher {
         let mut last_error: Option<String> = None;
         let mut suppressed_text_edit = false;
 
-        loop {
+        while !should_stop() {
             match capture_foreground_snapshot() {
                 Ok(snapshot) => {
                     last_error = None;
@@ -107,7 +148,192 @@ impl ForegroundWatcher {
             }
             thread::sleep(self.interval);
         }
+
+        Ok(())
     }
+}
+
+impl WindowsTray {
+    pub fn new(title: &str, tooltip: &str) -> Result<Self, String> {
+        let instance = unsafe { GetModuleHandleW(None) }
+            .map_err(|error| format!("GetModuleHandleW failed: {error}"))?;
+        let class_name = wide_null(TRAY_WINDOW_CLASS);
+        let title_text = wide_null(title);
+
+        let window_class = WNDCLASSW {
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }
+                .map_err(|error| format!("LoadCursorW failed: {error}"))?,
+            hInstance: instance.into(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            lpfnWndProc: Some(tray_window_proc),
+            hbrBackground: HBRUSH::default(),
+            ..Default::default()
+        };
+
+        let atom = unsafe { RegisterClassW(&window_class) };
+        if atom == 0 {
+            return Err("RegisterClassW failed".to_string());
+        }
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title_text.as_ptr()),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .map_err(|error| format!("CreateWindowExW failed: {error}"))?;
+
+        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }
+            .map_err(|error| format!("LoadIconW failed: {error}"))?;
+        let icon_data = build_tray_icon_data(hwnd, icon, tooltip);
+
+        unsafe { Shell_NotifyIconW(NIM_ADD, &icon_data) }
+            .ok()
+            .map_err(|error| format!("Shell_NotifyIconW add failed: {error}"))?;
+        unsafe { Shell_NotifyIconW(NIM_SETVERSION, &icon_data) }
+            .ok()
+            .map_err(|error| format!("Shell_NotifyIconW setversion failed: {error}"))?;
+
+        Ok(Self { hwnd, icon_data })
+    }
+
+    pub fn run(self) -> Result<(), String> {
+        let mut message = MSG::default();
+        loop {
+            let result = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+            if result == -1 {
+                break Err("GetMessageW failed".to_string());
+            }
+            if result == 0 {
+                break Ok(());
+            }
+
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+}
+
+impl Drop for WindowsTray {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &self.icon_data);
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+fn build_tray_icon_data(hwnd: WinHwnd, icon: HICON, tooltip: &str) -> NOTIFYICONDATAW {
+    let mut icon_data = NOTIFYICONDATAW::default();
+    icon_data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    icon_data.hWnd = hwnd;
+    icon_data.uID = 1;
+    icon_data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    icon_data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
+    icon_data.hIcon = icon;
+    copy_wide_string_into_buffer(tooltip, &mut icon_data.szTip);
+    icon_data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    icon_data
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn copy_wide_string_into_buffer<const N: usize>(value: &str, buffer: &mut [u16; N]) {
+    let encoded = wide_null(value);
+    let len = encoded.len().min(N);
+    buffer[..len].copy_from_slice(&encoded[..len]);
+    if len == N {
+        buffer[N - 1] = 0;
+    }
+}
+
+unsafe extern "system" fn tray_window_proc(
+    hwnd: WinHwnd,
+    message: u32,
+    wparam: WinWparam,
+    lparam: WinLparam,
+) -> WinLresult {
+    match message {
+        TRAY_CALLBACK_MESSAGE => {
+            if lparam.0 as u32 == WM_RBUTTONUP {
+                let _ = show_tray_menu(hwnd);
+            }
+            WinLresult(0)
+        }
+        WM_COMMAND => {
+            if wparam.0 == TRAY_EXIT_COMMAND_ID {
+                let _ = unsafe { DestroyWindow(hwnd) };
+            }
+            WinLresult(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            WinLresult(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+fn show_tray_menu(hwnd: WinHwnd) -> Result<(), String> {
+    let menu =
+        unsafe { CreatePopupMenu() }.map_err(|error| format!("CreatePopupMenu failed: {error}"))?;
+    let exit_label = wide_null("Exit");
+
+    if let Err(error) = unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            TRAY_EXIT_COMMAND_ID,
+            PCWSTR(exit_label.as_ptr()),
+        )
+    } {
+        let _ = unsafe { DestroyMenu(menu) };
+        return Err(format!("AppendMenuW failed: {error}"));
+    }
+
+    let mut cursor = POINT::default();
+    if let Err(error) = unsafe { GetCursorPos(&mut cursor) } {
+        let _ = unsafe { DestroyMenu(menu) };
+        return Err(format!("GetCursorPos failed: {error}"));
+    }
+    if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        let _ = unsafe { DestroyMenu(menu) };
+        return Err("SetForegroundWindow failed".to_string());
+    }
+    if !unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            Some(0),
+            hwnd,
+            None,
+        )
+    }
+    .as_bool()
+    {
+        let _ = unsafe { DestroyMenu(menu) };
+        return Err("TrackPopupMenu failed".to_string());
+    }
+    if let Err(error) = unsafe { DestroyMenu(menu) } {
+        return Err(format!("DestroyMenu failed: {error}"));
+    }
+    Ok(())
 }
 
 fn classify_snapshot_transition_with_state(
@@ -178,8 +404,7 @@ fn classify_snapshot_transition_with_state(
 }
 
 fn looks_like_text_edit(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
-    let document_delta =
-        current.document_len_utf16 as isize - previous.document_len_utf16 as isize;
+    let document_delta = current.document_len_utf16 as isize - previous.document_len_utf16 as isize;
     let selection_start_delta =
         current.selection_start_utf16 as isize - previous.selection_start_utf16 as isize;
     let selection_end_delta =
@@ -214,6 +439,7 @@ fn looks_like_newline_followup(previous: &TextSnapshot, current: &TextSnapshot) 
 struct ForegroundSnapshot {
     foreground_hwnd: isize,
     foreground_title: String,
+    process_name: String,
     thread_id: u32,
     focus_hwnd: isize,
     focus_class: String,
@@ -286,8 +512,9 @@ fn capture_foreground_snapshot() -> Result<ForegroundSnapshot, String> {
     } else {
         class_name(focus_hwnd)
     };
+    let process_name = process_name(process_id).unwrap_or_default();
 
-    let text_snapshot = capture_text_snapshot(focus_hwnd, &focus_class);
+    let text_snapshot = capture_text_snapshot(focus_hwnd, &focus_class, &process_name, &title);
     let ime_target_hwnd = resolve_ime_target_hwnd(hwnd, focus_hwnd);
     let (ime_mode, ime_error) = match read_ime_mode(ime_target_hwnd) {
         Ok(mode) => (Some(mode), None),
@@ -297,6 +524,7 @@ fn capture_foreground_snapshot() -> Result<ForegroundSnapshot, String> {
     Ok(ForegroundSnapshot {
         foreground_hwnd: hwnd as isize,
         foreground_title: title,
+        process_name,
         thread_id,
         focus_hwnd: focus_hwnd as isize,
         focus_class: focus_class.clone(),
@@ -631,7 +859,12 @@ fn input_mode_from_conversion_status(conversion_mode: Dword) -> InputMode {
     }
 }
 
-fn capture_text_snapshot(hwnd: HWND, class_name: &str) -> TextSnapshot {
+fn capture_text_snapshot(
+    hwnd: HWND,
+    class_name: &str,
+    process_name: &str,
+    foreground_title: &str,
+) -> TextSnapshot {
     let mut attempts = Vec::new();
 
     match capture_win32_edit_text(hwnd, class_name) {
@@ -645,6 +878,17 @@ fn capture_text_snapshot(hwnd: HWND, class_name: &str) -> TextSnapshot {
         }),
     }
 
+    match capture_app_adapter_text(hwnd, class_name, process_name, foreground_title) {
+        Ok(mut snapshot) => {
+            snapshot.attempts = attempts;
+            return snapshot;
+        }
+        Err(result) => attempts.push(TextReadAttempt {
+            source: "app_adapter",
+            result,
+        }),
+    }
+
     match capture_uia_text(hwnd) {
         Ok(mut snapshot) => {
             snapshot.attempts = attempts;
@@ -652,17 +896,6 @@ fn capture_text_snapshot(hwnd: HWND, class_name: &str) -> TextSnapshot {
         }
         Err(result) => attempts.push(TextReadAttempt {
             source: "uia_text_pattern",
-            result,
-        }),
-    }
-
-    match capture_app_adapter_text(hwnd, class_name) {
-        Ok(mut snapshot) => {
-            snapshot.attempts = attempts;
-            return snapshot;
-        }
-        Err(result) => attempts.push(TextReadAttempt {
-            source: "app_adapter",
             result,
         }),
     }
@@ -738,18 +971,53 @@ fn capture_uia_text(hwnd: HWND) -> Result<TextSnapshot, TextReadResult> {
         return Err(TextReadResult::Unsupported("missing_focus_hwnd"));
     }
 
-    read_uia_text(hwnd).map_err(|_| TextReadResult::Unsupported("uia_text_pattern_unavailable"))
+    read_uia_text(hwnd, None)
+        .map_err(|_| TextReadResult::Unsupported("uia_text_pattern_unavailable"))
 }
 
-fn capture_app_adapter_text(_hwnd: HWND, class_name: &str) -> Result<TextSnapshot, TextReadResult> {
-    let reason = match class_name {
-        "Chrome_WidgetWin_1" => "electron_adapter_not_connected",
-        _ => "no_app_adapter",
+fn capture_app_adapter_text(
+    hwnd: HWND,
+    class_name: &str,
+    process_name: &str,
+    foreground_title: &str,
+) -> Result<TextSnapshot, TextReadResult> {
+    let Some(adapter) = app_adapter_for_context(class_name, process_name, foreground_title) else {
+        return Err(TextReadResult::Unsupported("no_app_adapter"));
     };
-    Err(TextReadResult::Unsupported(reason))
+
+    read_uia_text(hwnd, Some(adapter))
+        .map(|mut snapshot| {
+            snapshot.source = "app_adapter";
+            snapshot
+        })
+        .map_err(|_| TextReadResult::Unsupported("app_adapter_unavailable"))
 }
 
-fn read_uia_text(hwnd: HWND) -> Result<TextSnapshot, windows::core::Error> {
+fn app_adapter_for_context(
+    class_name: &str,
+    process_name: &str,
+    _foreground_title: &str,
+) -> Option<AppAdapter> {
+    match (class_name, process_name) {
+        ("Chrome_WidgetWin_1", process_name)
+            if matches_known_chromium_editor_process(process_name) =>
+        {
+            Some(AppAdapter::ChromiumUia)
+        }
+        _ => None,
+    }
+}
+
+fn matches_known_chromium_editor_process(process_name: &str) -> bool {
+    process_name.eq_ignore_ascii_case("Code.exe")
+        || process_name.eq_ignore_ascii_case("Cursor.exe")
+        || process_name.eq_ignore_ascii_case("Obsidian.exe")
+}
+
+fn read_uia_text(
+    hwnd: HWND,
+    adapter: Option<AppAdapter>,
+) -> Result<TextSnapshot, windows::core::Error> {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
 
     let result = unsafe {
@@ -764,7 +1032,7 @@ fn read_uia_text(hwnd: HWND) -> Result<TextSnapshot, windows::core::Error> {
 
         let selected_range = selection.GetElement(0)?;
         let document_range = pattern.DocumentRange()?;
-        uia_range_to_line_snapshot(&document_range, &selected_range)
+        uia_range_to_line_snapshot(&document_range, &selected_range, adapter)
     };
 
     if com_initialized {
@@ -787,6 +1055,7 @@ fn focused_uia_element(
 fn uia_range_to_line_snapshot(
     document_range: &IUIAutomationTextRange,
     selected_range: &IUIAutomationTextRange,
+    adapter: Option<AppAdapter>,
 ) -> Result<TextSnapshot, windows::core::Error> {
     let line_range = unsafe { selected_range.Clone()? };
     unsafe { line_range.ExpandToEnclosingUnit(TextUnit_Line)? };
@@ -800,9 +1069,14 @@ fn uia_range_to_line_snapshot(
         )?
     };
 
-    let line_text = unsafe { line_range.GetText(-1)? }.to_string();
-    let document_text = unsafe { document_range.GetText(-1)? }.to_string();
-    let document_prefix_text = unsafe { document_prefix.GetText(-1)? }.to_string();
+    let line_text =
+        normalize_uia_text_for_adapter(unsafe { line_range.GetText(-1)? }.to_string(), adapter);
+    let document_text =
+        normalize_uia_text_for_adapter(unsafe { document_range.GetText(-1)? }.to_string(), adapter);
+    let document_prefix_text = normalize_uia_text_for_adapter(
+        unsafe { document_prefix.GetText(-1)? }.to_string(),
+        adapter,
+    );
     let line_index = uia_line_index(document_range, &line_range)?;
     let line_prefix = unsafe { line_range.Clone()? };
     unsafe {
@@ -812,7 +1086,8 @@ fn uia_range_to_line_snapshot(
             TextPatternRangeEndpoint_Start,
         )?
     };
-    let line_prefix_text = unsafe { line_prefix.GetText(-1)? }.to_string();
+    let line_prefix_text =
+        normalize_uia_text_for_adapter(unsafe { line_prefix.GetText(-1)? }.to_string(), adapter);
     let document_len_utf16 = document_text.encode_utf16().count();
     let selection_start_utf16 = document_prefix_text.encode_utf16().count();
     let selection_end_utf16 = selection_start_utf16;
@@ -830,6 +1105,23 @@ fn uia_range_to_line_snapshot(
         line_text,
         attempts: Vec::new(),
     })
+}
+
+fn normalize_uia_text_for_adapter(text: String, adapter: Option<AppAdapter>) -> String {
+    match adapter {
+        Some(AppAdapter::ChromiumUia) => text
+            .chars()
+            .filter(|ch| !is_chromium_uia_ghost_char(*ch))
+            .collect(),
+        None => text,
+    }
+}
+
+fn is_chromium_uia_ghost_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{FFFC}'
+    )
 }
 
 fn uia_line_index(
@@ -873,11 +1165,16 @@ fn print_snapshot(snapshot: &ForegroundSnapshot, debug: bool) {
 
     if debug {
         println!(
-            "{}Window{}   0x{:X}  thread={}  title=\"{}\"",
+            "{}Window{}   0x{:X}  thread={}  process={}  title=\"{}\"",
             COLOR_DIM,
             STYLE_RESET,
             snapshot.foreground_hwnd,
             snapshot.thread_id,
+            if snapshot.process_name.is_empty() {
+                "unknown"
+            } else {
+                &snapshot.process_name
+            },
             snapshot.foreground_title
         );
         println!(
@@ -960,12 +1257,12 @@ fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMo
                 );
                 if debug {
                     println!(
-                        "{}Decision{} skipped  reason=blank_line_preserve_mode  classifier_reason={}",
+                        "{}Decision{} skipped  reason=weak_signal_preserve_mode  classifier_reason={}",
                         COLOR_DIM, STYLE_RESET, decision.reason
                     );
                 }
                 println!(
-                    "{}Switch{}   skipped  reason=blank_line_preserve_mode",
+                    "{}Switch{}   skipped  reason=weak_signal_preserve_mode",
                     COLOR_YELLOW, STYLE_RESET
                 );
                 return;
@@ -1013,7 +1310,17 @@ fn classify_snapshot(snapshot: &TextSnapshot) -> Result<Decision, (usize, usize)
 }
 
 fn should_preserve_current_mode(snapshot: &TextSnapshot, decision: &Decision) -> bool {
-    snapshot.line_text.trim().is_empty() && decision.reason == DecisionReason::DefaultEnglish
+    decision.reason == DecisionReason::DefaultEnglish
+        && (snapshot.line_text.trim().is_empty() || is_placeholder_only_uia_line(snapshot))
+}
+
+fn is_placeholder_only_uia_line(snapshot: &TextSnapshot) -> bool {
+    snapshot.source == "uia_text_pattern"
+        && !snapshot.line_text.trim().is_empty()
+        && snapshot
+            .line_text
+            .chars()
+            .all(|ch| ch.is_whitespace() || !ch.is_alphanumeric())
 }
 
 fn print_watcher_switch(target_mode: InputMode) {
@@ -1107,6 +1414,38 @@ fn maybe_switch_watcher_mode(
 fn window_title(hwnd: HWND) -> String {
     let text = window_text_utf16(hwnd).unwrap_or_default();
     String::from_utf16_lossy(&text)
+}
+
+fn process_name(process_id: u32) -> Result<String, String> {
+    if process_id == 0 {
+        return Err("missing_process_id".to_string());
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(format!("OpenProcess failed for pid={process_id}"));
+    }
+
+    let mut buffer = vec![0u16; 260];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) };
+    let close_ok = unsafe { CloseHandle(process) };
+    if close_ok == 0 {
+        return Err(format!("CloseHandle failed for pid={process_id}"));
+    }
+    if ok == 0 {
+        return Err(format!(
+            "QueryFullProcessImageNameW failed for pid={process_id}"
+        ));
+    }
+
+    buffer.truncate(size as usize);
+    let path = String::from_utf16_lossy(&buffer);
+    Ok(path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or_default()
+        .to_string())
 }
 
 fn class_name(hwnd: HWND) -> String {
@@ -1222,6 +1561,8 @@ type Bool = i32;
 type Dword = u32;
 type Hwnd = *mut c_void;
 type HWND = Hwnd;
+type Handle = *mut c_void;
+type HANDLE = Handle;
 type Lparam = isize;
 type Wparam = usize;
 type Lresult = isize;
@@ -1243,6 +1584,7 @@ const IMC_SETCONVERSIONMODE: WPARAM = 0x0002;
 const IMC_GETOPENSTATUS: WPARAM = 0x0005;
 const IMC_SETOPENSTATUS: WPARAM = 0x0006;
 const IME_CMODE_NATIVE: Dword = 0x0001;
+const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1294,6 +1636,18 @@ unsafe extern "system" {
     fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CloseHandle(hObject: HANDLE) -> Bool;
+    fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> HANDLE;
+    fn QueryFullProcessImageNameW(
+        hProcess: HANDLE,
+        dwFlags: Dword,
+        lpExeName: *mut u16,
+        lpdwSize: *mut Dword,
+    ) -> Bool;
+}
+
 #[link(name = "imm32")]
 unsafe extern "system" {
     fn ImmGetDefaultIMEWnd(hWnd: HWND) -> HWND;
@@ -1312,10 +1666,11 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundSnapshot, IME_CMODE_NATIVE, TextReadAttempt, TextSnapshot, WatcherSwitchOutcome,
-        ime_conversion_status_for_mode, ime_open_status_for_mode,
-        input_mode_from_conversion_status, input_mode_from_open_status, maybe_switch_watcher_mode,
-        resolve_ime_target_hwnd, utf16_units_to_char_index,
+        AppAdapter, ForegroundSnapshot, IME_CMODE_NATIVE, TextReadAttempt, TextSnapshot,
+        WatcherSwitchOutcome, app_adapter_for_context, ime_conversion_status_for_mode,
+        ime_open_status_for_mode, input_mode_from_conversion_status, input_mode_from_open_status,
+        maybe_switch_watcher_mode, normalize_uia_text_for_adapter, resolve_ime_target_hwnd,
+        utf16_units_to_char_index,
     };
     use crate::ime::InputMode;
     use std::ptr::null_mut;
@@ -1324,6 +1679,7 @@ mod tests {
         ForegroundSnapshot {
             foreground_hwnd: 1,
             foreground_title: "title".to_string(),
+            process_name: "smart-shift-tests.exe".to_string(),
             thread_id: 1,
             focus_hwnd: 2,
             focus_class: "Edit".to_string(),
@@ -1352,6 +1708,56 @@ mod tests {
         let mut snapshot = snapshot(line_text);
         snapshot.text_snapshot.source = "uia_text_pattern";
         snapshot
+    }
+
+    #[test]
+    fn selects_chromium_adapter_for_chrome_widget() {
+        assert_eq!(
+            app_adapter_for_context("Chrome_WidgetWin_1", "Obsidian.exe", "note.md - Obsidian"),
+            Some(AppAdapter::ChromiumUia)
+        );
+    }
+
+    #[test]
+    fn does_not_select_adapter_for_unknown_chrome_widget_process() {
+        assert_eq!(
+            app_adapter_for_context(
+                "Chrome_WidgetWin_1",
+                "chrome.exe",
+                "Example - Google Chrome"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_select_adapter_for_plain_edit_control() {
+        assert_eq!(
+            app_adapter_for_context("Edit", "notepad.exe", "Untitled - Notepad"),
+            None
+        );
+    }
+
+    #[test]
+    fn chromium_adapter_strips_invisible_uia_ghost_chars() {
+        assert_eq!(
+            normalize_uia_text_for_adapter(
+                "\u{FFFC}he\u{200B}l\u{FEFF}lo\u{2060}".to_string(),
+                Some(AppAdapter::ChromiumUia)
+            ),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn chromium_adapter_preserves_visible_markdown_text() {
+        assert_eq!(
+            normalize_uia_text_for_adapter(
+                "## heading []".to_string(),
+                Some(AppAdapter::ChromiumUia)
+            ),
+            "## heading []"
+        );
     }
 
     #[test]
@@ -1626,7 +2032,8 @@ mod tests {
         let mut current = snapshot("");
         current.text_snapshot.document_len_utf16 = intermediate.text_snapshot.document_len_utf16;
         current.text_snapshot.line_index = 1;
-        current.text_snapshot.selection_start_utf16 = previous.text_snapshot.selection_start_utf16 + 2;
+        current.text_snapshot.selection_start_utf16 =
+            previous.text_snapshot.selection_start_utf16 + 2;
         current.text_snapshot.selection_end_utf16 = previous.text_snapshot.selection_end_utf16 + 2;
         current.text_snapshot.line_cursor_utf16 = 0;
         current.text_snapshot.line_cursor_chars = 0;
@@ -1665,8 +2072,41 @@ mod tests {
         let snapshot = snapshot("");
         let decision = super::classify_snapshot(&snapshot.text_snapshot).unwrap();
 
-        assert_eq!(decision.reason, crate::classifier::DecisionReason::DefaultEnglish);
+        assert_eq!(
+            decision.reason,
+            crate::classifier::DecisionReason::DefaultEnglish
+        );
         assert!(super::should_preserve_current_mode(
+            &snapshot.text_snapshot,
+            &decision
+        ));
+    }
+
+    #[test]
+    fn preserves_mode_for_uia_placeholder_only_default_english_line() {
+        let snapshot = uia_snapshot("## --- []");
+        let decision = super::classify_snapshot(&snapshot.text_snapshot).unwrap();
+
+        assert_eq!(
+            decision.reason,
+            crate::classifier::DecisionReason::DefaultEnglish
+        );
+        assert!(super::should_preserve_current_mode(
+            &snapshot.text_snapshot,
+            &decision
+        ));
+    }
+
+    #[test]
+    fn does_not_preserve_mode_for_win32_placeholder_only_default_english_line() {
+        let snapshot = snapshot("## --- []");
+        let decision = super::classify_snapshot(&snapshot.text_snapshot).unwrap();
+
+        assert_eq!(
+            decision.reason,
+            crate::classifier::DecisionReason::DefaultEnglish
+        );
+        assert!(!super::should_preserve_current_mode(
             &snapshot.text_snapshot,
             &decision
         ));
