@@ -1,8 +1,9 @@
 {
   "scripts": {
     "test": "cargo test",
-    "dev": "cargo run",
-    "cli": "cargo run --",
-    "watch": "cargo run -- --watch"
+    "dev": "cargo run -- --watch",
+    "watch": "cargo run -- --watch",
+    "classify": "cargo run --",
+    "cli": "cargo run --"
   }
 }
