@@ -32,9 +32,11 @@ This iteration focused on making the watcher match the intended background behav
 - Added `--debug` for verbose watcher diagnostics.
 - Removed IME mode/read-error changes from the emit condition, so manual `Shift` toggles do not trigger re-evaluation by themselves.
 - Allowed line changes to emit even when `document_len_utf16` changes, as long as the line index and cursor/selection/caret moved.
+- Suppressed the follow-up caret relocation that can happen immediately after `Enter`, so newline insertion does not get reclassified as a cursor relocation.
 - Compacted default terminal output to line text, current IME mode, target IME mode, and switch result.
 - Added ANSI color output for watcher summaries.
 - Improved Microsoft Pinyin support by reading and writing conversion mode through the default IME window before falling back to direct HIMC conversion status and open status.
+- Preserved the current IME mode on blank lines when the classifier only has the weak `default_english` signal.
 
 ## Background Watcher Behavior
 
@@ -55,6 +57,7 @@ Should not trigger:
 
 - Typing characters
 - Deleting characters
+- Pressing `Enter` to create a new blank line
 - IME commit that changes document length without a line relocation
 - Manual IME mode toggle by itself, such as pressing `Shift`
 
@@ -62,6 +65,7 @@ Current decision rule:
 
 - If `document_len_utf16` changed, normally treat it as editing and do not emit.
 - Exception: if `line_index` changed and the cursor, selection, or caret also moved, treat it as cursor relocation and emit.
+- If a text edit is immediately followed by the caret settling onto a fresh blank line after `Enter`, keep suppressing that follow-up transition.
 - If document length stayed the same and selection, cursor, caret, or visible line changed, emit.
 - IME mode changes are diagnostics only; they do not trigger a watcher emission.
 
@@ -108,6 +112,8 @@ With `--debug`, the watcher also prints detailed diagnostics:
 - switch errors
 
 Weak-signal lines such as blank UIA placeholders may classify as `target_mode=english` with `reason=default_english`, which can cause an unwanted auto-switch back to English.
+
+The watcher now treats a truly blank line with only a `default_english` signal as preserve-current-mode territory: it still reports the classifier result in debug context, but skips auto-switching and keeps the existing IME mode.
 
 ## IME Switching Notes
 

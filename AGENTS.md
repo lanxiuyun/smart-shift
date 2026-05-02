@@ -52,6 +52,7 @@ Should not trigger:
 
 - Typing characters
 - Deleting characters
+- Pressing `Enter` to create a new blank line
 - IME commit that changes document length without a line relocation
 - Manual IME mode toggle by itself
 
@@ -59,6 +60,7 @@ Current decision rule in `src/platform/windows.rs`:
 
 - If `document_len_utf16` changed, normally treat it as editing and do not emit
 - Exception: if `line_index` changed and the cursor, selection, or caret also moved, treat it as cursor relocation and emit
+- If a text edit is immediately followed by the caret settling onto a fresh blank line after `Enter`, keep suppressing that follow-up transition
 - If document length stayed the same and selection/cursor/caret/visible line changed, emit
 - IME mode changes are diagnostics only; they do not trigger a watcher emission
 
@@ -85,6 +87,11 @@ Fields available in watcher diagnostics:
 - `target_mode`: classifier output for the current line and cursor, when text is supported
 - `reason`: classifier reason for `target_mode`, when text is supported
 - `switch_attempted`, `switch_reason`, `ime_mode_after_switch`, `ime_switch_error`: watcher auto-switch diagnostics
+
+Auto-switch nuance:
+
+- A blank line may still classify as `target_mode=english` with `reason=default_english`
+- The watcher now treats that as a weak signal and preserves the current IME mode instead of auto-switching
 
 Default watcher output should stay compact and colored: current line text, current IME mode, target IME mode, and switch result. Extra window, focus, caret, selection, document length, classifier reason, and read/switch diagnostics should be printed only when `--debug` is set.
 

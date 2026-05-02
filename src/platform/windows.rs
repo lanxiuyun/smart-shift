@@ -1,4 +1,4 @@
-use crate::classifier::{Decision, classify};
+use crate::classifier::{Decision, DecisionReason, classify};
 use crate::context::LineContext;
 use crate::ime::InputMode;
 use std::ffi::c_void;
@@ -48,6 +48,13 @@ pub struct ForegroundWatcher {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotTransition {
+    Emit,
+    Ignore,
+    SuppressedTextEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatcherSwitchOutcome {
     Applied,
     SkippedAlreadyMatched,
@@ -73,15 +80,21 @@ impl ForegroundWatcher {
 
         let mut last_snapshot: Option<ForegroundSnapshot> = None;
         let mut last_error: Option<String> = None;
+        let mut suppressed_text_edit = false;
 
         loop {
             match capture_foreground_snapshot() {
                 Ok(snapshot) => {
                     last_error = None;
-                    let should_emit = should_emit_snapshot(last_snapshot.as_ref(), &snapshot);
-                    if should_emit {
+                    let transition = classify_snapshot_transition_with_state(
+                        last_snapshot.as_ref(),
+                        &snapshot,
+                        suppressed_text_edit,
+                    );
+                    if transition == SnapshotTransition::Emit {
                         print_snapshot(&snapshot, self.debug);
                     }
+                    suppressed_text_edit = transition == SnapshotTransition::SuppressedTextEdit;
                     last_snapshot = Some(snapshot);
                 }
                 Err(error) => {
@@ -97,12 +110,13 @@ impl ForegroundWatcher {
     }
 }
 
-fn should_emit_snapshot(
+fn classify_snapshot_transition_with_state(
     previous: Option<&ForegroundSnapshot>,
     current: &ForegroundSnapshot,
-) -> bool {
+    suppressed_text_edit: bool,
+) -> SnapshotTransition {
     let Some(previous) = previous else {
-        return true;
+        return SnapshotTransition::Emit;
     };
 
     if previous.foreground_hwnd != current.foreground_hwnd
@@ -110,7 +124,7 @@ fn should_emit_snapshot(
         || previous.focus_hwnd != current.focus_hwnd
         || previous.focus_class != current.focus_class
     {
-        return true;
+        return SnapshotTransition::Emit;
     }
 
     let previous_text = &previous.text_snapshot;
@@ -127,19 +141,73 @@ fn should_emit_snapshot(
         || previous.caret_bottom != current.caret_bottom;
 
     if previous_text.source != current_text.source {
-        return true;
+        return SnapshotTransition::Emit;
     }
 
     if previous_text.document_len_utf16 != current_text.document_len_utf16 {
-        return previous_text.line_index != current_text.line_index
-            && (cursor_changed || caret_changed);
+        if looks_like_text_edit(previous_text, current_text) {
+            return SnapshotTransition::SuppressedTextEdit;
+        }
+
+        return if previous_text.line_index != current_text.line_index
+            && (cursor_changed || caret_changed)
+        {
+            SnapshotTransition::Emit
+        } else {
+            SnapshotTransition::Ignore
+        };
+    }
+
+    if suppressed_text_edit && looks_like_newline_followup(previous_text, current_text) {
+        return SnapshotTransition::Ignore;
     }
 
     if previous_text.line_text != current_text.line_text {
-        return cursor_changed || caret_changed;
+        return if cursor_changed || caret_changed {
+            SnapshotTransition::Emit
+        } else {
+            SnapshotTransition::Ignore
+        };
     }
 
-    cursor_changed || caret_changed
+    if cursor_changed || caret_changed {
+        SnapshotTransition::Emit
+    } else {
+        SnapshotTransition::Ignore
+    }
+}
+
+fn looks_like_text_edit(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
+    let document_delta =
+        current.document_len_utf16 as isize - previous.document_len_utf16 as isize;
+    let selection_start_delta =
+        current.selection_start_utf16 as isize - previous.selection_start_utf16 as isize;
+    let selection_end_delta =
+        current.selection_end_utf16 as isize - previous.selection_end_utf16 as isize;
+
+    selection_start_delta == document_delta && selection_end_delta == document_delta
+}
+
+fn looks_like_newline_followup(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
+    if current.line_index != previous.line_index + 1 {
+        return false;
+    }
+
+    if current.line_cursor_utf16 != 0 || current.line_cursor_chars != 0 {
+        return false;
+    }
+
+    if !current.line_text.trim().is_empty() {
+        return false;
+    }
+
+    let previous_line_len_utf16 = previous.line_text.encode_utf16().count();
+    let previous_line_len_chars = previous.line_text.chars().count();
+
+    previous.line_cursor_utf16 == previous_line_len_utf16
+        && previous.line_cursor_chars == previous_line_len_chars
+        && current.selection_start_utf16 >= previous.selection_start_utf16
+        && current.selection_end_utf16 >= previous.selection_end_utf16
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -882,6 +950,27 @@ fn print_snapshot(snapshot: &ForegroundSnapshot, debug: bool) {
 fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMode>, debug: bool) {
     match classify_snapshot(snapshot) {
         Ok(decision) => {
+            if should_preserve_current_mode(snapshot, &decision) {
+                println!(
+                    "{}IME{}      current={}  target={}",
+                    COLOR_CYAN,
+                    STYLE_RESET,
+                    format_mode(current_mode),
+                    format_mode(current_mode)
+                );
+                if debug {
+                    println!(
+                        "{}Decision{} skipped  reason=blank_line_preserve_mode  classifier_reason={}",
+                        COLOR_DIM, STYLE_RESET, decision.reason
+                    );
+                }
+                println!(
+                    "{}Switch{}   skipped  reason=blank_line_preserve_mode",
+                    COLOR_YELLOW, STYLE_RESET
+                );
+                return;
+            }
+
             println!(
                 "{}IME{}      current={}  target={}",
                 COLOR_CYAN,
@@ -921,6 +1010,10 @@ fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMo
 fn classify_snapshot(snapshot: &TextSnapshot) -> Result<Decision, (usize, usize)> {
     let context = LineContext::new(snapshot.line_text.clone(), snapshot.line_cursor_chars)?;
     Ok(classify(&context))
+}
+
+fn should_preserve_current_mode(snapshot: &TextSnapshot, decision: &Decision) -> bool {
+    snapshot.line_text.trim().is_empty() && decision.reason == DecisionReason::DefaultEnglish
 }
 
 fn print_watcher_switch(target_mode: InputMode) {
@@ -1287,7 +1380,10 @@ mod tests {
         current.caret_left = 20;
         current.caret_right = 21;
 
-        assert!(!super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::SuppressedTextEdit
+        );
     }
 
     #[test]
@@ -1301,7 +1397,10 @@ mod tests {
         current.caret_left = 20;
         current.caret_right = 21;
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Emit
+        );
     }
 
     #[test]
@@ -1310,7 +1409,10 @@ mod tests {
         let mut current = snapshot("xyz");
         current.focus_hwnd = 99;
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Emit
+        );
     }
 
     #[test]
@@ -1319,7 +1421,10 @@ mod tests {
         let mut current = snapshot("abc");
         current.ime_mode = Some(InputMode::Chinese);
 
-        assert!(!super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Ignore
+        );
     }
 
     #[test]
@@ -1329,7 +1434,10 @@ mod tests {
         current.ime_mode = None;
         current.ime_error = Some("ImmGetContext returned null".to_string());
 
-        assert!(!super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Ignore
+        );
     }
 
     #[test]
@@ -1340,7 +1448,10 @@ mod tests {
         typed.text_snapshot.selection_end_utf16 = 1;
         typed.text_snapshot.line_cursor_utf16 = 1;
         typed.text_snapshot.line_cursor_chars = 1;
-        assert!(!super::should_emit_snapshot(Some(&previous), &typed));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &typed, false),
+            super::SnapshotTransition::SuppressedTextEdit
+        );
 
         let mut moved = typed.clone();
         moved.text_snapshot.selection_start_utf16 = 2;
@@ -1350,7 +1461,10 @@ mod tests {
         moved.caret_left = 30;
         moved.caret_right = 31;
 
-        assert!(super::should_emit_snapshot(Some(&typed), &moved));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&typed), &moved, false),
+            super::SnapshotTransition::Emit
+        );
     }
 
     #[test]
@@ -1366,7 +1480,10 @@ mod tests {
         current.caret_top = 40;
         current.caret_bottom = 50;
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Emit
+        );
     }
 
     #[test]
@@ -1385,7 +1502,10 @@ mod tests {
         previous.text_snapshot.line_cursor_utf16 = 52;
         previous.text_snapshot.line_cursor_chars = 52;
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Emit
+        );
     }
 
     #[test]
@@ -1399,7 +1519,10 @@ mod tests {
         current.caret_left = 40;
         current.caret_right = 41;
 
-        assert!(!super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Ignore
+        );
     }
 
     #[test]
@@ -1415,7 +1538,34 @@ mod tests {
         current.caret_top = 40;
         current.caret_bottom = 50;
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Emit
+        );
+    }
+
+    #[test]
+    fn ignores_newline_text_edit_even_when_line_changes() {
+        let mut previous = snapshot("first line");
+        previous.text_snapshot.selection_start_utf16 = previous.text_snapshot.document_len_utf16;
+        previous.text_snapshot.selection_end_utf16 = previous.text_snapshot.document_len_utf16;
+        previous.text_snapshot.line_cursor_utf16 = previous.text_snapshot.document_len_utf16;
+        previous.text_snapshot.line_cursor_chars = previous.text_snapshot.line_text.chars().count();
+
+        let mut current = snapshot("");
+        current.text_snapshot.document_len_utf16 = previous.text_snapshot.document_len_utf16 + 2;
+        current.text_snapshot.line_index = 1;
+        current.text_snapshot.selection_start_utf16 = previous.text_snapshot.document_len_utf16 + 2;
+        current.text_snapshot.selection_end_utf16 = previous.text_snapshot.document_len_utf16 + 2;
+        current.text_snapshot.line_cursor_utf16 = 0;
+        current.text_snapshot.line_cursor_chars = 0;
+        current.caret_top = 40;
+        current.caret_bottom = 50;
+
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::SuppressedTextEdit
+        );
     }
 
     #[test]
@@ -1436,7 +1586,10 @@ mod tests {
         previous.text_snapshot.line_cursor_utf16 = 9;
         previous.text_snapshot.line_cursor_chars = 9;
 
-        assert!(super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Emit
+        );
     }
 
     #[test]
@@ -1448,7 +1601,42 @@ mod tests {
         current.text_snapshot.line_cursor_utf16 = 4;
         current.text_snapshot.line_cursor_chars = 4;
 
-        assert!(!super::should_emit_snapshot(Some(&previous), &current));
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Ignore
+        );
+    }
+
+    #[test]
+    fn ignores_followup_cursor_move_after_newline_text_edit() {
+        let mut previous = snapshot("让我测试看看");
+        previous.text_snapshot.selection_start_utf16 = previous.text_snapshot.document_len_utf16;
+        previous.text_snapshot.selection_end_utf16 = previous.text_snapshot.document_len_utf16;
+        previous.text_snapshot.line_cursor_utf16 = previous.text_snapshot.document_len_utf16;
+        previous.text_snapshot.line_cursor_chars = previous.text_snapshot.line_text.chars().count();
+
+        let mut intermediate = previous.clone();
+        intermediate.text_snapshot.document_len_utf16 += 2;
+
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &intermediate, false),
+            super::SnapshotTransition::Ignore
+        );
+
+        let mut current = snapshot("");
+        current.text_snapshot.document_len_utf16 = intermediate.text_snapshot.document_len_utf16;
+        current.text_snapshot.line_index = 1;
+        current.text_snapshot.selection_start_utf16 = previous.text_snapshot.selection_start_utf16 + 2;
+        current.text_snapshot.selection_end_utf16 = previous.text_snapshot.selection_end_utf16 + 2;
+        current.text_snapshot.line_cursor_utf16 = 0;
+        current.text_snapshot.line_cursor_chars = 0;
+        current.caret_top = 40;
+        current.caret_bottom = 50;
+
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&intermediate), &current, true),
+            super::SnapshotTransition::Ignore
+        );
     }
 
     #[test]
@@ -1470,6 +1658,30 @@ mod tests {
             super::classify_snapshot(&snapshot.text_snapshot),
             Err((4, 3))
         );
+    }
+
+    #[test]
+    fn preserves_mode_for_blank_default_english_line() {
+        let snapshot = snapshot("");
+        let decision = super::classify_snapshot(&snapshot.text_snapshot).unwrap();
+
+        assert_eq!(decision.reason, crate::classifier::DecisionReason::DefaultEnglish);
+        assert!(super::should_preserve_current_mode(
+            &snapshot.text_snapshot,
+            &decision
+        ));
+    }
+
+    #[test]
+    fn does_not_preserve_mode_for_non_blank_line() {
+        let mut snapshot = snapshot("hello world");
+        snapshot.text_snapshot.line_cursor_chars = 1;
+        let decision = super::classify_snapshot(&snapshot.text_snapshot).unwrap();
+
+        assert!(!super::should_preserve_current_mode(
+            &snapshot.text_snapshot,
+            &decision
+        ));
     }
 
     #[test]
