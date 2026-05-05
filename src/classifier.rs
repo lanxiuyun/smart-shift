@@ -114,26 +114,26 @@ mod tests {
     }
 
     #[test]
-    fn picks_chinese_when_cursor_is_on_chinese_char() {
-        let decision = classify(&context("abc中文", 3));
+    fn picks_chinese_when_cursor_is_after_chinese_char() {
+        let decision = classify(&context("abc中文", 4)); //  cursor is after the Chinese character '中'
         assert_eq!(decision.mode, InputMode::Chinese);
     }
 
     #[test]
-    fn picks_english_when_cursor_is_on_english_char() {
-        let decision = classify(&context("中文abc", 2));
+    fn picks_english_when_cursor_is_after_english_char() {
+        let decision = classify(&context("中文abc", 3)); //  cursor is after the English character 'a'
         assert_eq!(decision.mode, InputMode::English);
     }
 
     #[test]
     fn uses_neighbor_bias_for_punctuation_gap() {
-        let decision = classify(&context("中文 () 中文", 3));
+        let decision = classify(&context("中文 () 中文", 3)); //  cursor is after the punctuation character '('
         assert_eq!(decision.mode, InputMode::Chinese);
     }
 
     #[test]
     fn falls_back_to_english_when_no_signal_exists() {
-        let decision = classify(&context("12345", 2));
+        let decision = classify(&context("12345", 2)); //  cursor is after the number character '2'
         assert_eq!(decision.mode, InputMode::English);
         assert_eq!(decision.reason, DecisionReason::DefaultEnglish);
     }

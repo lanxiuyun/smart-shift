@@ -23,29 +23,29 @@ impl LineContext {
     }
 
     pub fn current_char(&self) -> Option<char> {
-        self.line.chars().nth(self.cursor)
+        self.cursor.checked_sub(1).and_then(|i| self.line.chars().nth(i))
     }
 
     pub fn previous_char(&self) -> Option<char> {
         self.cursor
-            .checked_sub(1)
+            .checked_sub(2)
             .and_then(|index| self.line.chars().nth(index))
     }
 
     pub fn next_char(&self) -> Option<char> {
-        self.line.chars().nth(self.cursor + 1)
+        self.line.chars().nth(self.cursor)
     }
 
     pub fn chars_before_cursor(&self) -> impl Iterator<Item = char> + '_ {
         self.line
             .chars()
-            .take(self.cursor)
+            .take(self.cursor.saturating_sub(1))
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
     }
 
     pub fn chars_after_cursor(&self) -> impl Iterator<Item = char> + '_ {
-        self.line.chars().skip(self.cursor + 1)
+        self.line.chars().skip(self.cursor)
     }
 }
