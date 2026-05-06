@@ -1,19 +1,19 @@
-use crate::classifier::{Decision, DecisionReason, classify};
+use crate::classifier::{classify, Decision, DecisionReason};
 use crate::context::LineContext;
 use crate::ime::InputMode;
+use crate::logger::EventLogger;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
-use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HWND as WinHwnd,
-};
+use tauri::Emitter;
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND as WinHwnd};
 
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 
 use windows::Win32::UI::Accessibility::{
@@ -22,10 +22,8 @@ use windows::Win32::UI::Accessibility::{
     TextUnit_Line, UIA_TextPatternId,
 };
 
-use windows::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_OK, MessageBoxW,
-};
 use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 const STYLE_RESET: &str = "\x1b[0m";
 const STYLE_BOLD: &str = "\x1b[1m";
@@ -34,7 +32,6 @@ const COLOR_RED: &str = "\x1b[31m";
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_YELLOW: &str = "\x1b[33m";
 const COLOR_CYAN: &str = "\x1b[36m";
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppAdapter {
@@ -85,7 +82,9 @@ impl WindowsSingleInstance {
         let mutex_name = wide_null(name);
         let handle = unsafe { CreateMutexW(null_mut(), 0, PCWSTR(mutex_name.as_ptr())) };
         if handle.is_null() {
-            return Err(format!("CreateMutexW failed: {}", unsafe { GetLastError().0 }));
+            return Err(format!("CreateMutexW failed: {}", unsafe {
+                GetLastError().0
+            }));
         }
         let last_error = unsafe { GetLastError() };
         if last_error == ERROR_ALREADY_EXISTS {
@@ -139,6 +138,7 @@ pub struct ForegroundWatcher {
     interval: Duration,
     debug: bool,
     app_handle: Option<tauri::AppHandle>,
+    event_logger: Option<Arc<EventLogger>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,11 +156,17 @@ enum WatcherSwitchOutcome {
 }
 
 impl ForegroundWatcher {
-    pub fn new(interval_ms: u64, debug: bool, app_handle: Option<tauri::AppHandle>) -> Self {
+    pub fn new(
+        interval_ms: u64,
+        debug: bool,
+        app_handle: Option<tauri::AppHandle>,
+        event_logger: Option<Arc<EventLogger>>,
+    ) -> Self {
         Self {
             interval: Duration::from_millis(interval_ms.max(50)),
             debug,
             app_handle,
+            event_logger,
         }
     }
 
@@ -211,7 +217,12 @@ impl ForegroundWatcher {
                         suppressed_text_edit,
                     );
                     if transition == SnapshotTransition::Emit {
-                        print_snapshot(&snapshot, self.debug, &self.app_handle);
+                        print_snapshot(
+                            &snapshot,
+                            self.debug,
+                            &self.app_handle,
+                            self.event_logger.as_deref(),
+                        );
                     }
                     suppressed_text_edit = transition == SnapshotTransition::SuppressedTextEdit;
                     last_snapshot = Some(snapshot);
@@ -257,7 +268,12 @@ impl ForegroundWatcher {
                         suppressed_text_edit,
                     );
                     if transition == SnapshotTransition::Emit {
-                        print_snapshot(&snapshot, self.debug, &self.app_handle);
+                        print_snapshot(
+                            &snapshot,
+                            self.debug,
+                            &self.app_handle,
+                            self.event_logger.as_deref(),
+                        );
                     }
                     suppressed_text_edit = transition == SnapshotTransition::SuppressedTextEdit;
                     last_snapshot = Some(snapshot);
@@ -348,7 +364,9 @@ fn classify_snapshot_transition_with_state(
     }
 
     if previous_text.line_text != current_text.line_text {
-        return if cursor_changed || caret_changed {
+        return if looks_like_blank_line_input_edit(previous_text, current_text) {
+            SnapshotTransition::Ignore
+        } else if cursor_changed || caret_changed {
             SnapshotTransition::Emit
         } else {
             SnapshotTransition::Ignore
@@ -392,6 +410,20 @@ fn looks_like_newline_followup(previous: &TextSnapshot, current: &TextSnapshot) 
         && previous.line_cursor_chars == previous_line_len_chars
         && current.selection_start_utf16 >= previous.selection_start_utf16
         && current.selection_end_utf16 >= previous.selection_end_utf16
+}
+
+fn looks_like_blank_line_input_edit(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
+    previous.line_index == current.line_index
+        && is_weak_signal_line(previous)
+        && !current.line_text.trim().is_empty()
+        && current.selection_start_utf16 >= previous.selection_start_utf16
+        && current.selection_end_utf16 >= previous.selection_end_utf16
+        && current.line_cursor_utf16 >= previous.line_cursor_utf16
+        && current.line_cursor_chars >= previous.line_cursor_chars
+}
+
+fn is_weak_signal_line(snapshot: &TextSnapshot) -> bool {
+    snapshot.line_text.trim().is_empty() || is_placeholder_only_uia_line(snapshot)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1118,7 +1150,12 @@ fn uia_line_index(
     }
 }
 
-fn print_snapshot(snapshot: &ForegroundSnapshot, debug: bool, app_handle: &Option<tauri::AppHandle>) {
+fn print_snapshot(
+    snapshot: &ForegroundSnapshot,
+    debug: bool,
+    app_handle: &Option<tauri::AppHandle>,
+    event_logger: Option<&EventLogger>,
+) {
     println!();
     println!("{}smart-shift event{}", STYLE_BOLD, STYLE_RESET);
 
@@ -1182,7 +1219,7 @@ fn print_snapshot(snapshot: &ForegroundSnapshot, debug: bool, app_handle: &Optio
             );
         }
 
-        print_snapshot_decision(edit, snapshot.ime_mode, debug, app_handle);
+        print_snapshot_decision(edit, snapshot.ime_mode, debug, app_handle, event_logger);
     } else {
         println!("{}Line{}     unsupported", COLOR_YELLOW, STYLE_RESET);
         println!(
@@ -1201,8 +1238,10 @@ fn print_snapshot(snapshot: &ForegroundSnapshot, debug: bool, app_handle: &Optio
             }
         }
 
-        if let Some(ref app_handle) = app_handle {
-            let _ = app_handle.emit("watcher-event", WatcherEvent {
+        emit_watcher_event(
+            app_handle,
+            event_logger,
+            WatcherEvent {
                 line_text: String::new(),
                 source: "unsupported".to_string(),
                 current_mode: snapshot.ime_mode.map(|m| format!("{}", m)),
@@ -1211,12 +1250,18 @@ fn print_snapshot(snapshot: &ForegroundSnapshot, debug: bool, app_handle: &Optio
                 preserved: false,
                 reason: "text_unsupported".to_string(),
                 error: None,
-            });
-        }
+            },
+        );
     }
 }
 
-fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMode>, debug: bool, app_handle: &Option<tauri::AppHandle>) {
+fn print_snapshot_decision(
+    snapshot: &TextSnapshot,
+    current_mode: Option<InputMode>,
+    debug: bool,
+    app_handle: &Option<tauri::AppHandle>,
+    event_logger: Option<&EventLogger>,
+) {
     match classify_snapshot(snapshot) {
         Ok(decision) => {
             if should_preserve_current_mode(snapshot, &decision) {
@@ -1238,8 +1283,10 @@ fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMo
                     COLOR_YELLOW, STYLE_RESET
                 );
 
-                if let Some(ref app_handle) = app_handle {
-                    let _ = app_handle.emit("watcher-event", WatcherEvent {
+                emit_watcher_event(
+                    app_handle,
+                    event_logger,
+                    WatcherEvent {
                         line_text: snapshot.line_text.clone(),
                         source: snapshot.source.to_string(),
                         current_mode: current_mode.map(|m| format!("{}", m)),
@@ -1248,8 +1295,8 @@ fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMo
                         preserved: true,
                         reason: format!("{}", decision.reason),
                         error: None,
-                    });
-                }
+                    },
+                );
                 return;
             }
 
@@ -1266,20 +1313,28 @@ fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMo
                     COLOR_DIM, STYLE_RESET, decision.reason
                 );
             }
-            print_watcher_switch(decision.mode, app_handle);
+            let switch_result = print_watcher_switch(decision.mode);
+            let (switched, error) = match switch_result {
+                Ok(WatcherSwitchOutcome::Applied) => (true, None),
+                Ok(WatcherSwitchOutcome::SkippedAlreadyMatched)
+                | Ok(WatcherSwitchOutcome::SkippedUnknownCurrentMode) => (false, None),
+                Err(error) => (false, Some(error)),
+            };
 
-            if let Some(ref app_handle) = app_handle {
-                let _ = app_handle.emit("watcher-event", WatcherEvent {
+            emit_watcher_event(
+                app_handle,
+                event_logger,
+                WatcherEvent {
                     line_text: snapshot.line_text.clone(),
                     source: snapshot.source.to_string(),
                     current_mode: current_mode.map(|m| format!("{}", m)),
                     target_mode: Some(format!("{}", decision.mode)),
-                    switched: true,
+                    switched,
                     preserved: false,
                     reason: format!("{}", decision.reason),
-                    error: None,
-                });
-            }
+                    error,
+                },
+            );
         }
         Err((cursor, text_len)) => {
             println!(
@@ -1299,8 +1354,10 @@ fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMo
                 COLOR_YELLOW, STYLE_RESET
             );
 
-            if let Some(ref app_handle) = app_handle {
-                let _ = app_handle.emit("watcher-event", WatcherEvent {
+            emit_watcher_event(
+                app_handle,
+                event_logger,
+                WatcherEvent {
                     line_text: snapshot.line_text.clone(),
                     source: snapshot.source.to_string(),
                     current_mode: current_mode.map(|m| format!("{}", m)),
@@ -1309,8 +1366,8 @@ fn print_snapshot_decision(snapshot: &TextSnapshot, current_mode: Option<InputMo
                     preserved: false,
                     reason: "classification_unavailable".to_string(),
                     error: Some(format!("cursor={cursor} text_len={text_len}")),
-                });
-            }
+                },
+            );
         }
     }
 }
@@ -1321,8 +1378,7 @@ fn classify_snapshot(snapshot: &TextSnapshot) -> Result<Decision, (usize, usize)
 }
 
 fn should_preserve_current_mode(snapshot: &TextSnapshot, decision: &Decision) -> bool {
-    decision.reason == DecisionReason::DefaultChinese
-        && (snapshot.line_text.trim().is_empty() || is_placeholder_only_uia_line(snapshot))
+    decision.reason == DecisionReason::DefaultChinese && is_weak_signal_line(snapshot)
 }
 
 fn is_placeholder_only_uia_line(snapshot: &TextSnapshot) -> bool {
@@ -1334,7 +1390,20 @@ fn is_placeholder_only_uia_line(snapshot: &TextSnapshot) -> bool {
             .all(|ch| ch.is_whitespace() || !ch.is_alphanumeric())
 }
 
-fn print_watcher_switch(target_mode: InputMode, _app_handle: &Option<tauri::AppHandle>) {
+fn emit_watcher_event(
+    app_handle: &Option<tauri::AppHandle>,
+    event_logger: Option<&EventLogger>,
+    event: WatcherEvent,
+) {
+    if let Some(app_handle) = app_handle {
+        let _ = app_handle.emit("watcher-event", event.clone());
+    }
+    if let Some(event_logger) = event_logger {
+        let _ = event_logger.append_event(&event);
+    }
+}
+
+fn print_watcher_switch(target_mode: InputMode) -> Result<WatcherSwitchOutcome, String> {
     let controller = WindowsImeController::new();
     let current_mode = controller.current_mode().ok();
 
@@ -1370,7 +1439,7 @@ fn print_watcher_switch(target_mode: InputMode, _app_handle: &Option<tauri::AppH
                 }
             };
 
-            // emit handled by caller (print_snapshot_decision)
+            Ok(outcome)
         }
         Err(error) => {
             match controller.current_mode() {
@@ -1390,7 +1459,7 @@ fn print_watcher_switch(target_mode: InputMode, _app_handle: &Option<tauri::AppH
             }
             println!("{}         switch_error={error}{}", COLOR_DIM, STYLE_RESET);
 
-            // emit handled by caller (print_snapshot_decision)
+            Err(error)
         }
     }
 }
@@ -1409,6 +1478,16 @@ fn switch_color(outcome: WatcherSwitchOutcome) -> &'static str {
         WatcherSwitchOutcome::SkippedAlreadyMatched
         | WatcherSwitchOutcome::SkippedUnknownCurrentMode => COLOR_YELLOW,
     }
+}
+
+#[cfg(test)]
+fn tray_command_id(wparam: Wparam) -> usize {
+    wparam & 0xFFFF
+}
+
+#[cfg(test)]
+fn tray_callback_event(lparam: Lparam) -> UINT {
+    (lparam as usize & 0xFFFF) as UINT
 }
 
 fn maybe_switch_watcher_mode(
@@ -1589,6 +1668,10 @@ type UINT = u32;
 const WM_GETTEXT: UINT = 0x000D;
 const WM_GETTEXTLENGTH: UINT = 0x000E;
 const WM_IME_CONTROL: UINT = 0x0283;
+#[cfg(test)]
+const WM_LBUTTONUP: UINT = 0x0202;
+#[cfg(test)]
+const WM_RBUTTONUP: UINT = 0x0205;
 const EM_GETSEL: UINT = 0x00B0;
 const EM_GETLINE: UINT = 0x00C4;
 const EM_LINEFROMCHAR: UINT = 0x00C9;
@@ -1653,11 +1736,7 @@ unsafe extern "system" {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn CreateMutexW(
-        lpMutexAttributes: *mut c_void,
-        bInitialOwner: Bool,
-        lpName: PCWSTR,
-    ) -> HANDLE;
+    fn CreateMutexW(lpMutexAttributes: *mut c_void, bInitialOwner: Bool, lpName: PCWSTR) -> HANDLE;
     fn CloseHandle(hObject: HANDLE) -> Bool;
     fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> HANDLE;
     fn QueryFullProcessImageNameW(
@@ -1686,12 +1765,11 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppAdapter, ForegroundSnapshot, IME_CMODE_NATIVE, TextReadAttempt, TextSnapshot,
-        TrayRuntimeControl, WatcherSwitchOutcome, app_adapter_for_context,
-        ime_conversion_status_for_mode, ime_open_status_for_mode,
-        input_mode_from_conversion_status, input_mode_from_open_status,
-        maybe_switch_watcher_mode, normalize_uia_text_for_adapter, resolve_ime_target_hwnd,
-        utf16_units_to_char_index, WinLparam, WinWparam, WM_LBUTTONUP, WM_RBUTTONUP,
+        app_adapter_for_context, ime_conversion_status_for_mode, ime_open_status_for_mode,
+        input_mode_from_conversion_status, input_mode_from_open_status, maybe_switch_watcher_mode,
+        normalize_uia_text_for_adapter, resolve_ime_target_hwnd, utf16_units_to_char_index,
+        AppAdapter, ForegroundSnapshot, TextReadAttempt, TextSnapshot, TrayRuntimeControl,
+        WatcherSwitchOutcome, Wparam, IME_CMODE_NATIVE, WM_LBUTTONUP, WM_RBUTTONUP,
     };
     use crate::ime::InputMode;
     use std::ptr::null_mut;
@@ -1945,6 +2023,24 @@ mod tests {
         current.text_snapshot.line_cursor_chars = 4;
         current.caret_left = 40;
         current.caret_right = 41;
+
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Ignore
+        );
+    }
+
+    #[test]
+    fn ignores_same_line_text_change_when_document_length_is_unchanged() {
+        let previous = uia_snapshot("");
+        let mut current = uia_snapshot("a");
+        current.text_snapshot.document_len_utf16 = previous.text_snapshot.document_len_utf16;
+        current.text_snapshot.selection_start_utf16 = 1;
+        current.text_snapshot.selection_end_utf16 = 1;
+        current.text_snapshot.line_cursor_utf16 = 1;
+        current.text_snapshot.line_cursor_chars = 1;
+        current.caret_left = 20;
+        current.caret_right = 21;
 
         assert_eq!(
             super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
@@ -2239,7 +2335,7 @@ mod tests {
     #[test]
     fn tray_command_id_uses_low_word() {
         assert_eq!(
-            super::tray_command_id(WinWparam(1001usize << 16 | 42usize)),
+            super::tray_command_id(Wparam::from(1001u16) << 16 | Wparam::from(42u16)),
             42
         );
     }
@@ -2247,11 +2343,11 @@ mod tests {
     #[test]
     fn tray_callback_event_uses_low_word() {
         assert_eq!(
-            super::tray_callback_event(WinLparam((7isize << 16) | WM_RBUTTONUP as isize)),
+            super::tray_callback_event((7isize << 16) | WM_RBUTTONUP as isize),
             WM_RBUTTONUP
         );
         assert_eq!(
-            super::tray_callback_event(WinLparam((3isize << 16) | WM_LBUTTONUP as isize)),
+            super::tray_callback_event((3isize << 16) | WM_LBUTTONUP as isize),
             WM_LBUTTONUP
         );
     }

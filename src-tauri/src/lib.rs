@@ -1,15 +1,20 @@
 mod classifier;
 mod context;
 mod ime;
+mod logger;
 mod platform;
 
-use platform::windows::{ForegroundWatcher, TrayRuntimeControl, WindowsImeController, WindowsSingleInstance};
+use logger::EventLogger;
+use platform::windows::{
+    ForegroundWatcher, TrayRuntimeControl, WindowsImeController, WindowsSingleInstance,
+};
 use std::sync::Arc;
 use std::thread;
 use tauri::{Manager, State};
 
 pub struct AppState {
     watcher_control: Arc<TrayRuntimeControl>,
+    event_logger: Arc<EventLogger>,
 }
 
 #[tauri::command]
@@ -47,12 +52,36 @@ fn get_current_ime_mode() -> Result<String, String> {
         .map_err(|e| e)
 }
 
+#[tauri::command]
+fn get_log_file_path(state: State<'_, AppState>) -> Result<String, String> {
+    state
+        .event_logger
+        .current_log_path()
+        .map(|path| path.display().to_string())
+}
+
+#[tauri::command]
+fn get_recent_log_lines(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    state
+        .event_logger
+        .read_recent_lines(limit.unwrap_or(50).min(500))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let event_logger = Arc::new(EventLogger::new(
+        EventLogger::default_log_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("smart-shift").join("logs")),
+    ));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             watcher_control: Arc::new(TrayRuntimeControl::new()),
+            event_logger: event_logger.clone(),
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -67,9 +96,11 @@ pub fn run() {
             }
 
             let control = app.state::<AppState>().watcher_control.clone();
+            let event_logger = app.state::<AppState>().event_logger.clone();
             let app_handle = app.handle().clone();
             thread::spawn(move || {
-                let watcher = ForegroundWatcher::new(250, false, Some(app_handle));
+                let watcher =
+                    ForegroundWatcher::new(250, false, Some(app_handle), Some(event_logger));
                 let _ = watcher.run_until_controlled(&control);
             });
 
@@ -81,7 +112,8 @@ pub fn run() {
 
                 let menu = Menu::new(app)?;
                 let open_i = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
-                let toggle_i = MenuItem::with_id(app, "toggle", "Pause / Resume", true, None::<&str>)?;
+                let toggle_i =
+                    MenuItem::with_id(app, "toggle", "Pause / Resume", true, None::<&str>)?;
                 let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
                 menu.append(&open_i)?;
@@ -91,27 +123,25 @@ pub fn run() {
 
                 TrayIconBuilder::new()
                     .menu(&menu)
-                    .on_menu_event(|app, event| {
-                        match event.id.as_ref() {
-                            "open" => {
-                                if let Some(window) = app.get_webview_window("main") {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "open" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
                             }
-                            "toggle" => {
-                                if let Some(state) = app.try_state::<AppState>() {
-                                    state.watcher_control.toggle_paused();
-                                }
-                            }
-                            "quit" => {
-                                if let Some(state) = app.try_state::<AppState>() {
-                                    state.watcher_control.request_stop();
-                                }
-                                app.exit(0);
-                            }
-                            _ => {}
                         }
+                        "toggle" => {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                state.watcher_control.toggle_paused();
+                            }
+                        }
+                        "quit" => {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                state.watcher_control.request_stop();
+                            }
+                            app.exit(0);
+                        }
+                        _ => {}
                     })
                     .build(app)?;
             }
@@ -123,6 +153,8 @@ pub fn run() {
             toggle_watcher_pause,
             test_classify,
             get_current_ime_mode,
+            get_log_file_path,
+            get_recent_log_lines,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

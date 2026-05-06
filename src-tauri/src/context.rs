@@ -23,7 +23,9 @@ impl LineContext {
     }
 
     pub fn current_char(&self) -> Option<char> {
-        self.cursor.checked_sub(1).and_then(|i| self.line.chars().nth(i))
+        self.cursor
+            .checked_sub(1)
+            .and_then(|i| self.line.chars().nth(i))
     }
 
     #[allow(dead_code)]

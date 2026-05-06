@@ -1,76 +1,117 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-const status = ref({ paused: false });
+type WatcherStatus = {
+  paused: boolean;
+};
+
+type WatcherEventPayload = {
+  line_text: string;
+  source: string;
+  current_mode: string | null;
+  target_mode: string | null;
+  switched: boolean;
+  preserved: boolean;
+  reason: string;
+  error: string | null;
+};
+
+type ClassificationResult = {
+  line: string;
+  cursor: number;
+  target_mode: string;
+  reason: string;
+};
+
+const status = ref<WatcherStatus>({ paused: false });
 const imeMode = ref("unknown");
+const logFilePath = ref("");
 const testLine = ref("hello world");
 const testCursor = ref(0);
-const testResult = ref<any>(null);
+const testResult = ref<ClassificationResult | null>(null);
 const error = ref("");
-const logs = ref<any[]>([]);
-const maxLogs = 100;
+const liveLogs = ref<WatcherEventPayload[]>([]);
+const maxLiveLogs = 100;
 
 let pollTimer: number | null = null;
 let unlistenWatcher: (() => void) | null = null;
 
+function formatError(errorLike: unknown): string {
+  if (errorLike instanceof Error) {
+    return errorLike.message;
+  }
+  return String(errorLike);
+}
+
 async function fetchStatus() {
   try {
-    status.value = await invoke("get_watcher_status");
+    status.value = await invoke<WatcherStatus>("get_watcher_status");
     error.value = "";
-  } catch (e: any) {
-    error.value = String(e);
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
   }
 }
 
 async function fetchImeMode() {
   try {
-    imeMode.value = await invoke("get_current_ime_mode");
-  } catch (e: any) {
+    imeMode.value = await invoke<string>("get_current_ime_mode");
+  } catch {
     imeMode.value = "error";
+  }
+}
+
+async function fetchLogFilePath() {
+  try {
+    logFilePath.value = await invoke<string>("get_log_file_path");
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
   }
 }
 
 async function togglePause() {
   try {
-    const paused = await invoke("toggle_watcher_pause");
+    const paused = await invoke<boolean>("toggle_watcher_pause");
     status.value = { paused };
     error.value = "";
-  } catch (e: any) {
-    error.value = String(e);
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
   }
 }
 
 async function runTest() {
   try {
-    testResult.value = await invoke("test_classify", {
+    testResult.value = await invoke<ClassificationResult>("test_classify", {
       line: testLine.value,
       cursor: testCursor.value,
     });
     error.value = "";
-  } catch (e: any) {
-    error.value = String(e);
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
     testResult.value = null;
   }
 }
 
-function clearLogs() {
-  logs.value = [];
+function clearLiveLogs() {
+  liveLogs.value = [];
+}
+
+async function refreshDiagnostics() {
+  await Promise.all([fetchStatus(), fetchImeMode(), fetchLogFilePath()]);
 }
 
 onMounted(async () => {
-  fetchStatus();
-  fetchImeMode();
+  await refreshDiagnostics();
   pollTimer = window.setInterval(() => {
-    fetchStatus();
-    fetchImeMode();
+    void fetchStatus();
+    void fetchImeMode();
   }, 1000);
 
-  unlistenWatcher = await listen("watcher-event", (event) => {
-    logs.value.unshift(event.payload);
-    if (logs.value.length > maxLogs) {
-      logs.value.pop();
+  unlistenWatcher = await listen<WatcherEventPayload>("watcher-event", (event) => {
+    liveLogs.value.unshift(event.payload);
+    if (liveLogs.value.length > maxLiveLogs) {
+      liveLogs.value.pop();
     }
   });
 });
@@ -87,66 +128,96 @@ onUnmounted(() => {
 
 <template>
   <main class="container">
-    <h1>Smart Shift</h1>
-    <p class="subtitle">智能输入法切换器</p>
+    <header class="hero">
+      <p class="eyebrow">Windows IME watcher</p>
+      <h1>Smart Shift</h1>
+      <p class="subtitle">
+        Auto-switch the IME only when focus or caret location changes.
+      </p>
+    </header>
 
     <div v-if="error" class="error">{{ error }}</div>
 
     <section class="card">
-      <h2>运行状态</h2>
-      <div class="status-row">
-        <span class="label">Watcher：</span>
-        <span :class="['badge', status.paused ? 'paused' : 'running']">
-          {{ status.paused ? "已暂停" : "运行中" }}
-        </span>
+      <div class="section-head">
+        <h2>Runtime</h2>
+        <button class="btn-secondary" @click="refreshDiagnostics">Refresh</button>
       </div>
-      <div class="status-row">
-        <span class="label">当前 IME：</span>
-        <span class="badge">{{ imeMode }}</span>
+      <div class="status-grid">
+        <div class="status-tile">
+          <span class="label">Watcher</span>
+          <span :class="['badge', status.paused ? 'paused' : 'running']">
+            {{ status.paused ? "Paused" : "Running" }}
+          </span>
+        </div>
+        <div class="status-tile">
+          <span class="label">Current IME</span>
+          <span class="badge neutral">{{ imeMode }}</span>
+        </div>
       </div>
       <button class="btn-primary" @click="togglePause">
-        {{ status.paused ? "恢复监听" : "暂停监听" }}
+        {{ status.paused ? "Resume watcher" : "Pause watcher" }}
       </button>
     </section>
 
     <section class="card">
-      <h2>分类测试</h2>
+      <h2>Classifier Test</h2>
       <div class="form-row">
-        <label>文本：</label>
-        <input v-model="testLine" class="input" />
+        <label for="line">Line</label>
+        <input id="line" v-model="testLine" class="input" />
       </div>
       <div class="form-row">
-        <label>光标位置：</label>
-        <input v-model.number="testCursor" type="number" class="input" min="0" />
+        <label for="cursor">Cursor</label>
+        <input
+          id="cursor"
+          v-model.number="testCursor"
+          type="number"
+          class="input"
+          min="0"
+        />
       </div>
-      <button class="btn-primary" @click="runTest">测试分类</button>
+      <button class="btn-primary" @click="runTest">Run classify</button>
 
       <div v-if="testResult" class="result">
-        <div><strong>目标模式：</strong>{{ testResult.target_mode }}</div>
-        <div><strong>原因：</strong>{{ testResult.reason }}</div>
-        <div><strong>行内容：</strong>{{ testResult.line }}</div>
-        <div><strong>光标：</strong>{{ testResult.cursor }}</div>
+        <div><strong>Target mode:</strong> {{ testResult.target_mode }}</div>
+        <div><strong>Reason:</strong> {{ testResult.reason }}</div>
+        <div><strong>Line:</strong> {{ testResult.line }}</div>
+        <div><strong>Cursor:</strong> {{ testResult.cursor }}</div>
       </div>
     </section>
 
     <section class="card">
-      <h2>
-        事件日志
-        <button class="btn-small" @click="clearLogs">清空</button>
-      </h2>
-      <div class="log-list">
-        <div v-if="logs.length === 0" class="log-empty">暂无事件</div>
-        <div
-          v-for="(log, index) in logs"
-          :key="index"
-          :class="['log-item', log.preserved ? 'log-preserved' : '', log.switched ? 'log-switched' : '']"
-        >
-          <span class="log-source">[{{ log.source }}]</span>
-          <span class="log-text">{{ log.line_text || "(empty)" }}</span>
-          <span class="log-mode">
-            {{ log.current_mode || "?" }} → {{ log.target_mode || "?" }}
-          </span>
-          <span class="log-reason">({{ log.reason }})</span>
+      <div class="section-head">
+        <h2>Logs</h2>
+        <div class="actions">
+          <button class="btn-secondary" @click="clearLiveLogs">Clear live</button>
+        </div>
+      </div>
+      <p class="path-line">
+        <span class="label">Today file</span>
+        <code>{{ logFilePath || "Unavailable" }}</code>
+      </p>
+
+      <div class="log-panel">
+        <h3>Event log</h3>
+        <div class="log-list">
+          <div v-if="liveLogs.length === 0" class="log-empty">No live events yet.</div>
+          <div
+            v-for="(log, index) in liveLogs"
+            :key="`live-${index}`"
+            :class="[
+              'log-item',
+              log.preserved ? 'log-preserved' : '',
+              log.switched ? 'log-switched' : '',
+            ]"
+          >
+            <span class="log-source">[{{ log.source }}]</span>
+            <span class="log-text">{{ log.line_text || "(empty)" }}</span>
+            <span class="log-mode">
+              {{ log.current_mode || "?" }} -> {{ log.target_mode || "?" }}
+            </span>
+            <span class="log-reason">{{ log.reason }}</span>
+          </div>
         </div>
       </div>
     </section>
@@ -154,160 +225,220 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+:global(body) {
+  margin: 0;
+  background:
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.75), transparent 35%),
+    linear-gradient(180deg, #f4efe8 0%, #e7ecf3 100%);
+  color: #172033;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
 .container {
-  max-width: 560px;
+  max-width: 1040px;
   margin: 0 auto;
-  padding: 24px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  padding: 32px 20px 48px;
 }
 
-h1 {
-  font-size: 1.8rem;
-  margin-bottom: 4px;
-  text-align: center;
-}
-
-.subtitle {
-  text-align: center;
-  color: #888;
-  margin-top: 0;
-  margin-bottom: 24px;
-}
-
-.card {
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-  padding: 20px;
+.hero {
   margin-bottom: 20px;
 }
 
-.card h2 {
-  font-size: 1.1rem;
-  margin-top: 0;
-  margin-bottom: 14px;
-  color: #333;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+.eyebrow {
+  margin: 0 0 8px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #8c4a2f;
 }
 
-.status-row {
+h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 3.25rem);
+  line-height: 1;
+}
+
+.subtitle {
+  max-width: 640px;
+  margin: 12px 0 0;
+  color: #4b5565;
+  font-size: 1rem;
+}
+
+.card {
+  margin-top: 18px;
+  padding: 20px;
+  border: 1px solid rgba(23, 32, 51, 0.08);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.78);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 16px 40px rgba(23, 32, 51, 0.08);
+}
+
+.section-head {
   display: flex;
   align-items: center;
-  margin-bottom: 10px;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h2,
+h3 {
+  margin: 0;
+}
+
+h2 {
+  font-size: 1.15rem;
+}
+
+h3 {
+  font-size: 0.95rem;
+  color: #374151;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.status-tile {
+  padding: 14px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(23, 32, 51, 0.04), rgba(140, 74, 47, 0.08));
 }
 
 .label {
-  color: #555;
-  min-width: 80px;
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 .badge {
-  display: inline-block;
-  padding: 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
   border-radius: 999px;
-  background: #eee;
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: #333;
+  font-size: 0.88rem;
+  font-weight: 700;
 }
 
 .badge.running {
-  background: #d4edda;
-  color: #155724;
+  background: #dff7eb;
+  color: #0f6b43;
 }
 
 .badge.paused {
-  background: #fff3cd;
-  color: #856404;
+  background: #fff1d6;
+  color: #9a5a00;
+}
+
+.badge.neutral {
+  background: #e8eef8;
+  color: #24436b;
+}
+
+.btn-primary,
+.btn-secondary {
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
 }
 
 .btn-primary {
-  margin-top: 10px;
-  padding: 8px 16px;
-  border: none;
-  border-radius: 8px;
-  background: #2b6cb0;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, #1f5d8d, #3f7d58);
   color: #fff;
-  font-size: 0.95rem;
-  cursor: pointer;
-  transition: background 0.2s;
 }
 
-.btn-primary:hover {
-  background: #2c5282;
+.btn-secondary {
+  padding: 8px 14px;
+  background: #eef2f7;
+  color: #243247;
 }
 
-.btn-small {
-  padding: 4px 10px;
-  border: none;
-  border-radius: 6px;
-  background: #e2e8f0;
-  color: #4a5568;
-  font-size: 0.8rem;
-  cursor: pointer;
-}
-
-.btn-small:hover {
-  background: #cbd5e0;
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .form-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 12px;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.form-row label {
-  min-width: 80px;
-  color: #555;
+  margin: 12px 0;
 }
 
 .input {
-  flex: 1;
-  padding: 6px 10px;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  font-size: 0.95rem;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d7dce5;
+  border-radius: 12px;
+  background: #fff;
+  color: inherit;
+  box-sizing: border-box;
 }
 
 .result {
   margin-top: 14px;
-  padding: 12px;
-  background: #f8f9fa;
-  border-radius: 8px;
-  font-size: 0.9rem;
-  line-height: 1.6;
+  padding: 14px;
+  border-radius: 14px;
+  background: #f5f7fb;
+  line-height: 1.7;
+}
+
+.path-line {
+  margin: 16px 0 0;
+}
+
+.path-line code {
+  display: inline-block;
+  max-width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #f4f6fa;
+  word-break: break-all;
+}
+
+.log-panel {
+  min-width: 0;
+  margin-top: 16px;
 }
 
 .log-list {
-  max-height: 300px;
+  max-height: 320px;
+  margin-top: 10px;
   overflow-y: auto;
-  border: 1px solid #eee;
-  border-radius: 8px;
-  padding: 8px;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  background: rgba(245, 247, 251, 0.8);
 }
 
 .log-empty {
-  color: #aaa;
-  text-align: center;
   padding: 20px;
-  font-size: 0.9rem;
+  text-align: center;
+  color: #94a3b8;
 }
 
 .log-item {
-  padding: 6px 8px;
-  border-radius: 4px;
-  font-size: 0.85rem;
-  margin-bottom: 4px;
-  background: #f8f9fa;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #fff;
 }
 
 .log-item:last-child {
@@ -315,85 +446,56 @@ h1 {
 }
 
 .log-switched {
-  background: #e6fffa;
-  border-left: 3px solid #38b2ac;
+  border-left: 4px solid #1c8c5c;
 }
 
 .log-preserved {
-  background: #fffaf0;
-  border-left: 3px solid #ed8936;
+  border-left: 4px solid #d47a24;
 }
 
-.log-source {
-  color: #888;
-  font-size: 0.75rem;
-  min-width: 80px;
+.log-source,
+.log-reason {
+  color: #64748b;
+  font-size: 0.78rem;
 }
 
 .log-text {
-  flex: 1;
-  color: #333;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  color: #172033;
+  font-weight: 600;
+  word-break: break-word;
 }
 
 .log-mode {
-  color: #555;
-  font-weight: 600;
-}
-
-.log-reason {
-  color: #888;
-  font-size: 0.75rem;
+  color: #334155;
+  font-size: 0.84rem;
 }
 
 .error {
-  background: #f8d7da;
-  color: #721c24;
-  padding: 10px 14px;
-  border-radius: 8px;
-  margin-bottom: 16px;
+  margin-top: 18px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #fee2e2;
+  color: #991b1b;
 }
 
-@media (prefers-color-scheme: dark) {
+@media (max-width: 720px) {
   .container {
-    color: #f0f0f0;
+    padding-inline: 14px;
   }
+
   .card {
-    background: #1e1e1e;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    padding: 16px;
+    border-radius: 16px;
   }
-  .card h2 {
-    color: #f0f0f0;
+
+  .section-head {
+    align-items: flex-start;
+    flex-direction: column;
   }
-  .label,
-  .form-row label {
-    color: #bbb;
-  }
-  .input {
-    background: #2a2a2a;
-    border-color: #444;
-    color: #f0f0f0;
-  }
-  .result {
-    background: #2a2a2a;
-  }
-  .badge {
-    background: #333;
-    color: #eee;
-  }
-  .log-item {
-    background: #2a2a2a;
-  }
-  .log-switched {
-    background: #1a3c3c;
-  }
-  .log-preserved {
-    background: #3c2a1a;
-  }
-  .log-text {
-    color: #eee;
+
+  .form-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
   }
 }
 </style>
