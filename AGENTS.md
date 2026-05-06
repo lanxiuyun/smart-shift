@@ -2,62 +2,81 @@
 
 ## Project Overview
 
-`smart-shift` is a Windows-first input method editor (IME) auto-switching tool. It watches the active text input location, classifies the current cursor context as Chinese or English, and automatically switches the IME mode when the cursor moves to a context that needs a different mode.
+`smart-shift` is a **Windows-first input method editor (IME) auto-switching tool** built with Tauri v2 + Vue 3. It watches the active text input location, classifies the current cursor context as Chinese or English, and automatically switches the IME mode when the cursor moves to a context that needs a different mode.
 
-The project has two distinct layers:
+The project has completed its migration from a standalone CLI (`command/`) to a full Tauri desktop application. All core logic now lives inside `src-tauri/src/` and is active at runtime.
 
-1. **Core Rust engine** (`command/`): A standalone Rust binary/library that implements the actual IME switching logic, background foreground watcher, system tray integration, and Win32/UI Automation text extraction. This is the functional heart of the application.
-2. **Tauri frontend wrapper** (`src-tauri/`, `src/`): A Tauri v2 + Vue 3 + TypeScript desktop application shell. As of the current state, this wrapper is a stock Tauri template with only a demo `greet` command and is **not yet integrated** with the core Rust engine.
+**Core experience**:
+- Cursor moves to a Chinese paragraph → auto-switch to Chinese IME
+- Cursor moves to an English paragraph → auto-switch to English IME
+- **Never triggers while typing**; only on cursor movement, focus change, or mouse click
+- Runs persistently in the system tray after launch
 
-The project is at a transition point: the core engine is a sophisticated, well-tested prototype, while the Tauri wrapper remains an unconnected scaffold.
+**Target users**: Programmers, writers, and anyone who frequently switches between Chinese and English/code input.
+
+**Distribution**: Packaged Windows desktop app (`.msi`/`.exe`).
+
+---
+
+## Architecture Decisions
+
+| Decision | Conclusion |
+|----------|------------|
+| `command/` fate | **Abandoned**. All functionality migrated into the Tauri app; no separate CLI maintained |
+| Frontend role | **Hybrid resident mode**. Starts to tray; main window serves as status/log/configuration panel |
+| Release scope | **Public release**. Needs compatibility, onboarding, installer, docs |
+| Weak-signal strategy | **Blank lines default to Chinese**. Classifier defaults to Chinese until an explicit English signal appears |
+
+---
 
 ## Technology Stack
 
 - **Frontend**: Vue 3.5+, TypeScript ~5.6, Vite 6
 - **Desktop framework**: Tauri v2 (Rust edition 2021)
-- **Core engine**: Rust (edition 2024), Win32 FFI, Windows UI Automation
+- **Core engine**: Rust, Win32 FFI, Windows UI Automation
 - **Package manager**: pnpm
 - **Platform**: Windows only (relies heavily on Win32 APIs)
+
+---
 
 ## Project Structure
 
 ```
 .
 ├── src/                    # Frontend Vue application
-│   ├── App.vue             # Root component (stock Tauri+Vue template)
+│   ├── App.vue             # Main control panel (status, logs, test tool)
 │   ├── main.ts             # Vue app entry point
 │   ├── vite-env.d.ts       # Vite client types
-│   └── assets/             # Static assets (logos)
-├── src-tauri/              # Tauri Rust wrapper
+│   └── assets/             # Static assets
+├── src-tauri/              # Tauri Rust backend
 │   ├── src/
-│   │   ├── lib.rs          # Tauri command definitions and Builder setup
-│   │   └── main.rs         # Entry point (GUI subsystem on Windows release)
-│   ├── Cargo.toml          # Tauri app crate (name: smart-shift, edition 2021)
-│   ├── tauri.conf.json     # Tauri configuration (identifier: com.lanxiuyun.smart-shift)
-│   ├── build.rs            # tauri_build::build()
-│   └── capabilities/       # Permission scopes
-├── command/                # Core Rust engine (the actual application logic)
-│   ├── src/
-│   │   ├── main.rs         # Binary entry (CLI args parse, dispatch)
-│   │   ├── lib.rs          # Library exports: app, classifier, context, ime, platform
-│   │   ├── app.rs          # CLI behavior, background watcher dispatch, tray demo
+│   │   ├── lib.rs          # Tauri commands, tray setup, watcher thread spawn
+│   │   ├── main.rs         # Entry point (GUI subsystem on Windows release)
 │   │   ├── classifier.rs   # Chinese/English classification logic
 │   │   ├── context.rs      # Line/cursor context helpers
 │   │   ├── ime.rs          # InputMode enum (Chinese/English)
 │   │   └── platform/
 │   │       ├── mod.rs      # Platform module root
-│   │       └── windows.rs  # Win32 watcher, tray, IME control, UIA/Win32 text extraction
-│   ├── Cargo.toml          # Core crate (name: smart-shift, edition 2024)
-│   └── README.md           # Detailed user-facing documentation
+│   │       └── windows.rs  # Win32 watcher, IME control, UIA/Win32 text extraction, WatcherEvent
+│   ├── Cargo.toml          # Tauri app crate (name: smart-shift, edition 2021)
+│   │                       # Dependencies: tauri (with tray-icon), windows 0.61.3, log
+│   ├── tauri.conf.json     # Tauri configuration (identifier: com.lanxiuyun.smart-shift)
+│   ├── build.rs            # tauri_build::build()
+│   └── capabilities/       # Permission scopes
+├── command/                # (LEGACY) Old standalone CLI — to be removed
+│   └── ...
 ├── package.json            # Frontend dependencies and scripts
 ├── vite.config.ts          # Vite config (port 1420, Tauri-tailored HMR)
 ├── tsconfig.json           # TypeScript strict config
+├── DevelopmentPlan.md      # Product feature roadmap
 └── index.html              # Vite entry HTML
 ```
 
+---
+
 ## Build and Development Commands
 
-### Frontend / Tauri (root directory)
+### Full Tauri Application (root directory)
 
 ```bash
 # Install dependencies
@@ -76,38 +95,30 @@ pnpm build
 pnpm tauri build
 ```
 
-### Core Rust Engine (`command/` directory)
+### Rust Backend Only (`src-tauri/` directory)
 
 ```bash
+cd src-tauri
+
+# Type-check / lint
+cargo check
+
 # Run unit tests
 cargo test
-
-# Tray demo (no console window, GUI subsystem)
-cargo run
-
-# Console background watcher
-cargo run -- --watch --interval-ms 150
-
-# Watcher with verbose diagnostics
-cargo run -- --watch --debug --interval-ms 150
-
-# One-shot classification
-cargo run -- --line "hello world" --cursor 0
-
-# One-shot classification + apply IME switch
-cargo run -- --line "hello world" --cursor 0 --apply
 
 # Release build
 cargo build --release
 ```
 
+---
+
 ## Code Style Guidelines
 
-### Rust (`command/` and `src-tauri/`)
+### Rust (`src-tauri/`)
 
-- **Editions**: `command/` uses Rust 2024; `src-tauri/` uses Rust 2021.
+- **Edition**: Rust 2021
 - Naming: Standard Rust conventions (`PascalCase` for types/enums, `snake_case` for functions/variables).
-- Error handling: Uses `Result` with custom error enums (`AppError` in `command/src/app.rs`).
+- Error handling: Uses `Result` with `String` errors for platform code; custom error enums where appropriate.
 - Platform code: Heavy use of `unsafe` for Win32 FFI, wrapped in safe abstractions where possible.
 - Custom type aliases are used in Win32 code for clarity (`HWND`, `Dword`, `Bool`, etc.).
 - UTF-16 wide-string helpers exist for Win32 API interop.
@@ -118,16 +129,17 @@ cargo build --release
 - Strict TypeScript with `noUnusedLocals`, `noUnusedParameters`, `noFallthroughCasesInSwitch`.
 - ESM modules (`"type": "module"` in `package.json`).
 
+---
+
 ## Testing Instructions
 
-### Rust (`command/`)
+### Rust (`src-tauri/`)
 
 The project uses standard `cargo test` with extensive inline `#[cfg(test)]` modules.
 
 Tests exist in:
-- `command/src/app.rs` — apply outcome tests
-- `command/src/classifier.rs` — classification logic tests (CJK detection, neighbor bias, fallback)
-- `command/src/platform/windows.rs` — 40+ tests covering:
+- `src-tauri/src/classifier.rs` — classification logic tests (CJK detection, neighbor bias, fallback)
+- `src-tauri/src/platform/windows.rs` — 40+ tests covering:
   - Snapshot transition classification (emit/ignore/suppress)
   - App adapter selection (Chromium/Electron)
   - Ghost character stripping
@@ -138,19 +150,22 @@ Tests exist in:
 
 Run all tests:
 ```bash
-cd command && cargo test
+cd src-tauri && cargo test
 ```
 
 ### Frontend
 
-**No test framework is currently configured** in the root project. There is no Vitest, Jest, or Playwright setup.
+**No test framework is currently configured**. There is no Vitest, Jest, or Playwright setup.
+
+---
 
 ## Architecture and Module Divisions
 
-### Dual-Layer Design
+### Three-Layer Design
 
 1. **Rule layer** (`classifier.rs` + `context.rs`): Pure logic, platform-agnostic. Takes a `LineContext` and returns a `Decision` (Chinese/English + reason).
-2. **Platform layer** (`platform/windows.rs`): All Win32 API interaction, I/O, GUI, and text extraction.
+2. **Platform layer** (`platform/windows.rs`): All Win32 API interaction, I/O, text extraction, IME control, and watcher event emission.
+3. **Integration layer** (`lib.rs`): Tauri `Builder` setup, tray configuration, watcher thread spawn, Tauri Commands, and `AppHandle` event emission bridge.
 
 ### Text Snapshot Sources
 
@@ -166,6 +181,18 @@ The foreground watcher supports multiple text extraction strategies:
 3. IMM open status (`ImmGetOpenStatus` / `ImmSetOpenStatus`)
 4. Default IME window open status (`IMC_GETOPENSTATUS` / `IMC_SETOPENSTATUS`)
 5. Verification readback after each write
+
+### Event Flow (watcher → frontend)
+
+```
+ForegroundWatcher::run_until_controlled
+  └── capture_foreground_snapshot
+        └── classify_snapshot / should_preserve_current_mode / maybe_switch_watcher_mode
+              └── AppHandle::emit("watcher-event", WatcherEvent)
+                    └── Vue frontend: listen("watcher-event", handler)
+```
+
+---
 
 ## Key Development Conventions
 
@@ -192,7 +219,7 @@ The watcher polls on an interval and must **only emit on cursor/focus relocation
 
 ### Weak Signal Protection
 
-Blank lines or placeholder-only UIA lines may classify as `target_mode=english` with `reason=default_english`. The watcher treats this as a weak signal and **preserves the current IME mode** instead of auto-switching.
+Blank lines or placeholder-only UIA lines may classify with `reason=default_chinese`. The watcher treats weak-signal blank/placeholder lines as **preserve-current-mode** territory and skips auto-switching to avoid unwanted toggles.
 
 ### UIA Line Semantics
 
@@ -202,18 +229,34 @@ For UIA `TextPattern`, `line_index` and cursor offsets follow `TextUnit_Line`, n
 
 Chromium/Electron adapters are selected by **control class plus process name** (not class alone), to avoid matching every browser window.
 
+---
+
+## Tauri Commands
+
+| Command | Arguments | Returns | Description |
+|---------|-----------|---------|-------------|
+| `get_watcher_status` | — | `{ paused: boolean }` | Whether the watcher is paused |
+| `toggle_watcher_pause` | — | `boolean` | Toggles pause state, returns new `paused` value |
+| `test_classify` | `line: string`, `cursor: number` | `{ line, cursor, target_mode, reason }` | One-shot classification test |
+| `get_current_ime_mode` | — | `string` | Current IME mode (`chinese` or `english`) |
+
+---
+
 ## Security Considerations
 
 - `src-tauri/tauri.conf.json` sets `csp: null`. Content Security Policy is currently disabled.
 - The Tauri app identifier is `com.lanxiuyun.smart-shift`.
 - The core engine uses `unsafe` Win32 FFI extensively; correctness depends on proper COM initialization (`CoInitializeEx`) and HWND lifetime management.
-- Single-instance protection in tray mode uses a named Windows mutex (`smart-shift`).
+- Single-instance protection uses a named Windows mutex (`smart-shift-tauri`).
+
+---
 
 ## Important Notes for Agents
 
-- **Do not assume the Tauri wrapper is connected to the core engine.** They are separate crates. The `command/` crate is not a dependency of `src-tauri/` yet.
-- When modifying watcher behavior, **add or update unit tests** in `command/src/platform/windows.rs`.
+- **The core engine is now fully integrated**. `src-tauri/src/platform/windows.rs` contains all Win32 watcher logic and is active at runtime. The old `command/` directory is legacy and will be removed.
+- When modifying watcher behavior, **add or update unit tests** in `src-tauri/src/platform/windows.rs`.
 - Be careful when changing UIA behavior; UIA lines, visible wrapped lines, Markdown-rendered lines, and raw newline-delimited lines are not always the same thing.
 - Microsoft Pinyin compatibility requires the conversion-mode path (`IME_CMODE_NATIVE`) rather than only IMM open status.
 - The project uses `cargo` for Rust and `pnpm` for Node. Do not mix package managers.
-- The `command/` crate uses Rust edition 2024, which is newer than `src-tauri/`'s edition 2021.
+- The `tray-icon` Tauri feature is required for system tray support; do not remove it from `Cargo.toml`.
+- `WatcherEvent` is emitted on every watcher trigger; when adding new fields, update both the Rust struct and the Vue listener.

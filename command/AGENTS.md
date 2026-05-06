@@ -1,5 +1,7 @@
 # AGENTS.md
 
+> ⚠️ **DEPRECATED**: This `command/` directory is the legacy standalone CLI implementation. All core logic has been migrated to `src-tauri/src/` and integrated into the Tauri desktop application. This directory will be removed in a future cleanup. Do not add new features here.
+
 ## Project
 
 `smart-shift` is a Windows-first input method switching tool.

@@ -32,33 +32,34 @@ Smart Shift 是一个 **Windows 平台的后台输入法自动切换工具**，�
 目标：Tauri 应用达到并超过原有 `command/` 的能力，可日常自用。
 
 ### Rust 后端
-- [ ] **托盘集成**
+- [x] **托盘集成**
   - Tauri v2 TrayIcon，启动后默认不弹主窗口
   - 托盘菜单：Open（打开主窗口）、Pause / Resume、Exit
   - 关闭主窗口时隐藏到托盘，不退出应用
-- [ ] **watcher 事件推送**
+- [x] **watcher 事件推送**
   - 每次触发时通过 `AppHandle::emit` 发送事件到前端
   - 事件内容：行文本、current_mode、target_mode、切换结果、原因
-- [ ] **分类器策略修正**
+- [x] **分类器策略修正**
   - 将 `DefaultEnglish` 改为 `DefaultChinese`
   - 空白行默认保持中文输入法
-- [ ] **优雅退出**
+- [x] **优雅退出**
   - 应用退出时通知 watcher 线程停止，避免强制终止
 
 ### Vue 前端
-- [ ] **状态面板**
+- [x] **状态面板**
   - 显示 watcher 状态（监听中 / 已暂停）
   - 显示当前 IME 模式
   - Pause / Resume 按钮
-- [ ] **实时事件日志**
+- [x] **实时事件日志**
   - 滚动显示 watcher 每次触发的事件
   - 支持 Debug 模式开关（显示窗口句柄、控件类名、焦点信息等）
-- [ ] **分类测试工具**
+- [x] **分类测试工具**
   - 输入文本 + 光标位置，查看分类结果（模式 + 原因）
 
 ### 构建
-- [ ] `cargo tauri build` 产出可用安装包
-- [ ] Windows GUI subsystem，无控制台黑窗
+- [x] `cargo check` 编译通过
+- [ ] `cargo tauri build` 产出可用安装包（待验证）
+- [x] Windows GUI subsystem，无控制台黑窗
 
 ---
 
@@ -139,8 +140,43 @@ Smart Shift 是一个 **Windows 平台的后台输入法自动切换工具**，�
 
 ## 废弃 `command/` 的迁移 checklist
 
-- [ ] 确认所有核心逻辑已复制到 `src-tauri/src/`
-- [ ] 确认 `command/` 中的测试已迁移或在 Tauri 中重写
+- [x] 确认所有核心逻辑已复制到 `src-tauri/src/`
+- [x] 确认 `command/` 中的测试已迁移到 `src-tauri/src/platform/windows.rs`
 - [ ] 从仓库中删除 `command/` 文件夹（或移入 archive 分支）
 - [ ] 更新根目录 `README.md`，说明这是 Tauri 应用
 - [ ] 更新构建脚本，移除 `command/` 相关的 dev 脚本
+
+---
+
+## 本次修改总结（Phase 1 完成）
+
+### 已完成的改动
+
+1. **核心模块迁移**：将 `command/src/` 下的 `classifier.rs`、`context.rs`、`ime.rs`、`platform/windows.rs` 迁移到 `src-tauri/src/`，并移除其中与 CLI/Win32 托盘相关的代码。
+
+2. **分类器策略修正**：将弱信号默认策略从 `DefaultEnglish` 改为 `DefaultChinese`，空白行/纯符号行默认保持中文输入法。
+
+3. **watcher 事件推送**：`ForegroundWatcher` 持有 `tauri::AppHandle`，每次触发时 emit `watcher-event` 事件到前端。定义了 `WatcherEvent` 结构体统一事件格式。
+
+4. **Tauri 托盘集成**：
+   - `Cargo.toml` 开启 `tray-icon` feature
+   - 使用 `TrayIconBuilder` 创建托盘图标和右键菜单（Open / Pause/Resume / Quit）
+   - 关闭主窗口时隐藏到托盘（`CloseRequested` + `prevent_close`）
+   - 启动后默认不弹主窗口
+
+5. **优雅退出**：托盘 "Quit" 菜单先调用 `TrayRuntimeControl::request_stop()` 通知 watcher 线程退出循环，再执行 `app.exit(0)`。
+
+6. **前端控制面板**（`src/App.vue`）：
+   - 状态面板：显示 watcher 状态和当前 IME 模式
+   - 实时事件日志：监听 `watcher-event`，最多保留 100 条
+   - 分类测试工具：输入文本 + 光标位置查看分类结果
+   - 每 1 秒轮询一次状态和 IME 模式
+
+7. **Tauri Commands**：`get_watcher_status`、`toggle_watcher_pause`、`test_classify`、`get_current_ime_mode`。
+
+### 下一步行动
+
+进入 Phase 2：
+1. 日志落盘（文件日志 + 前端查看）
+2. 配置持久化（轮询间隔、Debug 模式、启动自动监听）
+3. 修复已知 Bug（空白行输入字母误切换、换行符光标切换）
