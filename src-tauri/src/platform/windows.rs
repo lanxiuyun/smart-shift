@@ -134,11 +134,23 @@ pub struct WatcherEvent {
     pub preserved: bool,
     pub reason: String,
     pub error: Option<String>,
+    pub debug: bool,
+    pub window_title: Option<String>,
+    pub process_name: Option<String>,
+    pub focus_class: Option<String>,
+    pub ime_error: Option<String>,
+    pub caret: Option<String>,
+    pub doc_len: Option<usize>,
+    pub selection_start: Option<usize>,
+    pub selection_end: Option<usize>,
+    pub line_number: Option<usize>,
+    pub cursor_utf16: Option<usize>,
+    pub cursor_chars: Option<usize>,
 }
 
 pub struct ForegroundWatcher {
     interval: Duration,
-    debug: bool,
+    debug: Arc<AtomicBool>,
     app_handle: Option<tauri::AppHandle>,
     event_logger: Option<Arc<EventLogger>>,
 }
@@ -160,7 +172,7 @@ enum WatcherSwitchOutcome {
 impl ForegroundWatcher {
     pub fn new(
         interval_ms: u64,
-        debug: bool,
+        debug: Arc<AtomicBool>,
         app_handle: Option<tauri::AppHandle>,
         event_logger: Option<Arc<EventLogger>>,
     ) -> Self {
@@ -188,7 +200,7 @@ impl ForegroundWatcher {
             STYLE_BOLD,
             STYLE_RESET,
             self.interval.as_millis(),
-            self.debug
+            self.debug.load(Ordering::Relaxed)
         );
 
         let mut last_snapshot: Option<ForegroundSnapshot> = None;
@@ -229,7 +241,7 @@ impl ForegroundWatcher {
                     if transition == SnapshotTransition::Emit {
                         print_snapshot(
                             &snapshot,
-                            self.debug,
+                            self.debug.load(Ordering::Relaxed),
                             &self.app_handle,
                             self.event_logger.as_deref(),
                         );
@@ -261,7 +273,7 @@ impl ForegroundWatcher {
             STYLE_BOLD,
             STYLE_RESET,
             self.interval.as_millis(),
-            self.debug
+            self.debug.load(Ordering::Relaxed)
         );
 
         let mut last_snapshot: Option<ForegroundSnapshot> = None;
@@ -288,7 +300,7 @@ impl ForegroundWatcher {
                     if transition == SnapshotTransition::Emit {
                         print_snapshot(
                             &snapshot,
-                            self.debug,
+                            self.debug.load(Ordering::Relaxed),
                             &self.app_handle,
                             self.event_logger.as_deref(),
                         );
@@ -1501,7 +1513,7 @@ fn print_snapshot(
             );
         }
 
-        print_snapshot_decision(edit, snapshot.ime_mode, debug, app_handle, event_logger);
+        print_snapshot_decision(snapshot, debug, app_handle, event_logger);
     } else {
         println!("{}Line{}     unsupported", COLOR_YELLOW, STYLE_RESET);
         println!(
@@ -1532,21 +1544,34 @@ fn print_snapshot(
                 preserved: false,
                 reason: "text_unsupported".to_string(),
                 error: None,
+                debug,
+                window_title: if debug { Some(snapshot.foreground_title.clone()) } else { None },
+                process_name: if debug { Some(snapshot.process_name.clone()) } else { None },
+                focus_class: if debug { Some(snapshot.focus_class.clone()) } else { None },
+                ime_error: if debug { snapshot.ime_error.clone() } else { None },
+                caret: if debug { Some(format!("hwnd=0x{:X} rect=({}, {}, {}, {})", snapshot.caret_hwnd, snapshot.caret_left, snapshot.caret_top, snapshot.caret_right, snapshot.caret_bottom)) } else { None },
+                doc_len: None,
+                selection_start: None,
+                selection_end: None,
+                line_number: None,
+                cursor_utf16: None,
+                cursor_chars: None,
             },
         );
     }
 }
 
 fn print_snapshot_decision(
-    snapshot: &TextSnapshot,
-    current_mode: Option<InputMode>,
+    snapshot: &ForegroundSnapshot,
     debug: bool,
     app_handle: &Option<tauri::AppHandle>,
     event_logger: Option<&EventLogger>,
 ) {
-    match classify_snapshot(snapshot) {
+    let edit = &snapshot.text_snapshot;
+    let current_mode = snapshot.ime_mode;
+    match classify_snapshot(edit) {
         Ok(decision) => {
-            if should_preserve_current_mode(snapshot, &decision) {
+            if should_preserve_current_mode(edit, &decision) {
                 println!(
                     "{}IME{}      current={}  target={}",
                     COLOR_CYAN,
@@ -1569,14 +1594,26 @@ fn print_snapshot_decision(
                     app_handle,
                     event_logger,
                     WatcherEvent {
-                        line_text: snapshot.line_text.clone(),
-                        source: snapshot.source.to_string(),
+                        line_text: edit.line_text.clone(),
+                        source: edit.source.to_string(),
                         current_mode: current_mode.map(|m| format!("{}", m)),
                         target_mode: current_mode.map(|m| format!("{}", m)),
                         switched: false,
                         preserved: true,
                         reason: format!("{}", decision.reason),
                         error: None,
+                        debug,
+                        window_title: if debug { Some(snapshot.foreground_title.clone()) } else { None },
+                        process_name: if debug { Some(snapshot.process_name.clone()) } else { None },
+                        focus_class: if debug { Some(snapshot.focus_class.clone()) } else { None },
+                        ime_error: if debug { snapshot.ime_error.clone() } else { None },
+                        caret: if debug { Some(format!("hwnd=0x{:X} rect=({}, {}, {}, {})", snapshot.caret_hwnd, snapshot.caret_left, snapshot.caret_top, snapshot.caret_right, snapshot.caret_bottom)) } else { None },
+                        doc_len: if debug { Some(edit.document_len_utf16) } else { None },
+                        selection_start: if debug { Some(edit.selection_start_utf16) } else { None },
+                        selection_end: if debug { Some(edit.selection_end_utf16) } else { None },
+                        line_number: if debug { Some(edit.line_index) } else { None },
+                        cursor_utf16: if debug { Some(edit.line_cursor_utf16) } else { None },
+                        cursor_chars: if debug { Some(edit.line_cursor_chars) } else { None },
                     },
                 );
                 return;
@@ -1607,14 +1644,26 @@ fn print_snapshot_decision(
                 app_handle,
                 event_logger,
                 WatcherEvent {
-                    line_text: snapshot.line_text.clone(),
-                    source: snapshot.source.to_string(),
+                    line_text: edit.line_text.clone(),
+                    source: edit.source.to_string(),
                     current_mode: current_mode.map(|m| format!("{}", m)),
                     target_mode: Some(format!("{}", decision.mode)),
                     switched,
                     preserved: false,
                     reason: format!("{}", decision.reason),
                     error,
+                    debug,
+                    window_title: if debug { Some(snapshot.foreground_title.clone()) } else { None },
+                    process_name: if debug { Some(snapshot.process_name.clone()) } else { None },
+                    focus_class: if debug { Some(snapshot.focus_class.clone()) } else { None },
+                    ime_error: if debug { snapshot.ime_error.clone() } else { None },
+                    caret: if debug { Some(format!("hwnd=0x{:X} rect=({}, {}, {}, {})", snapshot.caret_hwnd, snapshot.caret_left, snapshot.caret_top, snapshot.caret_right, snapshot.caret_bottom)) } else { None },
+                    doc_len: if debug { Some(edit.document_len_utf16) } else { None },
+                    selection_start: if debug { Some(edit.selection_start_utf16) } else { None },
+                    selection_end: if debug { Some(edit.selection_end_utf16) } else { None },
+                    line_number: if debug { Some(edit.line_index) } else { None },
+                    cursor_utf16: if debug { Some(edit.line_cursor_utf16) } else { None },
+                    cursor_chars: if debug { Some(edit.line_cursor_chars) } else { None },
                 },
             );
         }
@@ -1640,14 +1689,26 @@ fn print_snapshot_decision(
                 app_handle,
                 event_logger,
                 WatcherEvent {
-                    line_text: snapshot.line_text.clone(),
-                    source: snapshot.source.to_string(),
+                    line_text: edit.line_text.clone(),
+                    source: edit.source.to_string(),
                     current_mode: current_mode.map(|m| format!("{}", m)),
                     target_mode: None,
                     switched: false,
                     preserved: false,
                     reason: "classification_unavailable".to_string(),
                     error: Some(format!("cursor={cursor} text_len={text_len}")),
+                    debug,
+                    window_title: if debug { Some(snapshot.foreground_title.clone()) } else { None },
+                    process_name: if debug { Some(snapshot.process_name.clone()) } else { None },
+                    focus_class: if debug { Some(snapshot.focus_class.clone()) } else { None },
+                    ime_error: if debug { snapshot.ime_error.clone() } else { None },
+                    caret: if debug { Some(format!("hwnd=0x{:X} rect=({}, {}, {}, {})", snapshot.caret_hwnd, snapshot.caret_left, snapshot.caret_top, snapshot.caret_right, snapshot.caret_bottom)) } else { None },
+                    doc_len: if debug { Some(edit.document_len_utf16) } else { None },
+                    selection_start: if debug { Some(edit.selection_start_utf16) } else { None },
+                    selection_end: if debug { Some(edit.selection_end_utf16) } else { None },
+                    line_number: if debug { Some(edit.line_index) } else { None },
+                    cursor_utf16: if debug { Some(edit.line_cursor_utf16) } else { None },
+                    cursor_chars: if debug { Some(edit.line_cursor_chars) } else { None },
                 },
             );
         }

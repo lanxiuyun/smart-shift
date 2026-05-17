@@ -8,6 +8,7 @@ use logger::EventLogger;
 use platform::windows::{
     ForegroundWatcher, TrayRuntimeControl, WindowsImeController, WindowsSingleInstance,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tauri::{Manager, State};
@@ -15,6 +16,7 @@ use tauri::{Manager, State};
 pub struct AppState {
     watcher_control: Arc<TrayRuntimeControl>,
     event_logger: Arc<EventLogger>,
+    debug_mode: Arc<AtomicBool>,
 }
 
 #[tauri::command]
@@ -53,6 +55,17 @@ fn get_current_ime_mode() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_debug_mode(state: State<'_, AppState>) -> bool {
+    state.debug_mode.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn set_debug_mode(enabled: bool, state: State<'_, AppState>) -> bool {
+    state.debug_mode.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+#[tauri::command]
 fn get_log_file_path(state: State<'_, AppState>) -> Result<String, String> {
     state
         .event_logger
@@ -82,6 +95,7 @@ pub fn run() {
         .manage(AppState {
             watcher_control: Arc::new(TrayRuntimeControl::new()),
             event_logger: event_logger.clone(),
+            debug_mode: Arc::new(AtomicBool::new(false)),
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -95,12 +109,17 @@ pub fn run() {
                 std::process::exit(1);
             }
 
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+
             let control = app.state::<AppState>().watcher_control.clone();
             let event_logger = app.state::<AppState>().event_logger.clone();
+            let debug_mode = app.state::<AppState>().debug_mode.clone();
             let app_handle = app.handle().clone();
             thread::spawn(move || {
                 let watcher =
-                    ForegroundWatcher::new(250, false, Some(app_handle), Some(event_logger));
+                    ForegroundWatcher::new(250, debug_mode, Some(app_handle), Some(event_logger));
                 let _ = watcher.run_until_controlled(&control);
             });
 
@@ -155,6 +174,8 @@ pub fn run() {
             get_current_ime_mode,
             get_log_file_path,
             get_recent_log_lines,
+            get_debug_mode,
+            set_debug_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

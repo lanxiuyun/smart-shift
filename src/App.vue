@@ -16,6 +16,18 @@ type WatcherEventPayload = {
   preserved: boolean;
   reason: string;
   error: string | null;
+  debug: boolean;
+  window_title: string | null;
+  process_name: string | null;
+  focus_class: string | null;
+  ime_error: string | null;
+  caret: string | null;
+  doc_len: number | null;
+  selection_start: number | null;
+  selection_end: number | null;
+  line_number: number | null;
+  cursor_utf16: number | null;
+  cursor_chars: number | null;
 };
 
 type ClassificationResult = {
@@ -27,6 +39,7 @@ type ClassificationResult = {
 
 const status = ref<WatcherStatus>({ paused: false });
 const imeMode = ref("unknown");
+const debugMode = ref(false);
 const logFilePath = ref("");
 const testLine = ref("hello world");
 const testCursor = ref(0);
@@ -59,6 +72,24 @@ async function fetchImeMode() {
     imeMode.value = await invoke<string>("get_current_ime_mode");
   } catch {
     imeMode.value = "error";
+  }
+}
+
+async function fetchDebugMode() {
+  try {
+    debugMode.value = await invoke<boolean>("get_debug_mode");
+  } catch {
+    debugMode.value = false;
+  }
+}
+
+async function toggleDebug() {
+  try {
+    const enabled = await invoke<boolean>("set_debug_mode", { enabled: !debugMode.value });
+    debugMode.value = enabled;
+    error.value = "";
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
   }
 }
 
@@ -98,7 +129,7 @@ function clearLiveLogs() {
 }
 
 async function refreshDiagnostics() {
-  await Promise.all([fetchStatus(), fetchImeMode(), fetchLogFilePath()]);
+  await Promise.all([fetchStatus(), fetchImeMode(), fetchDebugMode(), fetchLogFilePath()]);
 }
 
 onMounted(async () => {
@@ -155,9 +186,14 @@ onUnmounted(() => {
           <span class="badge neutral">{{ imeMode }}</span>
         </div>
       </div>
-      <button class="btn-primary" @click="togglePause">
-        {{ status.paused ? "Resume watcher" : "Pause watcher" }}
-      </button>
+      <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;">
+        <button class="btn-primary" @click="togglePause">
+          {{ status.paused ? "Resume watcher" : "Pause watcher" }}
+        </button>
+        <button :class="['btn-secondary', debugMode ? 'active-debug' : '']" @click="toggleDebug">
+          {{ debugMode ? "Debug: ON" : "Debug: OFF" }}
+        </button>
+      </div>
     </section>
 
     <section class="card">
@@ -217,6 +253,20 @@ onUnmounted(() => {
               {{ log.current_mode || "?" }} -> {{ log.target_mode || "?" }}
             </span>
             <span class="log-reason">{{ log.reason }}</span>
+            <div v-if="log.debug" class="log-debug">
+              <div v-if="log.window_title"><strong>Window:</strong> {{ log.window_title }}</div>
+              <div v-if="log.process_name"><strong>Process:</strong> {{ log.process_name }}</div>
+              <div v-if="log.focus_class"><strong>Focus class:</strong> {{ log.focus_class }}</div>
+              <div v-if="log.caret"><strong>Caret:</strong> {{ log.caret }}</div>
+              <div v-if="log.doc_len !== null"><strong>Doc len:</strong> {{ log.doc_len }}</div>
+              <div v-if="log.selection_start !== null && log.selection_end !== null">
+                <strong>Selection:</strong> {{ log.selection_start }} - {{ log.selection_end }}
+              </div>
+              <div v-if="log.line_number !== null"><strong>Line:</strong> {{ log.line_number }}</div>
+              <div v-if="log.cursor_utf16 !== null"><strong>Cursor utf16:</strong> {{ log.cursor_utf16 }}</div>
+              <div v-if="log.cursor_chars !== null"><strong>Cursor chars:</strong> {{ log.cursor_chars }}</div>
+              <div v-if="log.ime_error"><strong>IME error:</strong> {{ log.ime_error }}</div>
+            </div>
           </div>
         </div>
       </div>
@@ -468,6 +518,22 @@ h3 {
 .log-mode {
   color: #334155;
   font-size: 0.84rem;
+}
+
+.btn-secondary.active-debug {
+  background: #dff7eb;
+  color: #0f6b43;
+  border: 1px solid #1c8c5c;
+}
+
+.log-debug {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #f4f6fa;
+  font-size: 0.78rem;
+  color: #4b5565;
+  line-height: 1.6;
 }
 
 .error {
