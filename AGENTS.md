@@ -10,6 +10,7 @@ The project has completed its migration from a standalone CLI (`command/`) to a 
 - Cursor moves to a Chinese paragraph → auto-switch to Chinese IME
 - Cursor moves to an English paragraph → auto-switch to English IME
 - **Never triggers while typing**; only on cursor movement, focus change, or mouse click
+- **Never triggers during IME composition** (pinyin input, etc.)
 - Runs persistently in the system tray after launch
 
 **Target users**: Programmers, writers, and anyone who frequently switches between Chinese and English/code input.
@@ -26,6 +27,7 @@ The project has completed its migration from a standalone CLI (`command/`) to a 
 | Frontend role | **Hybrid resident mode**. Starts to tray; main window serves as status/log/configuration panel |
 | Release scope | **Public release**. Needs compatibility, onboarding, installer, docs |
 | Weak-signal strategy | **Blank lines default to Chinese**. Classifier defaults to Chinese until an explicit English signal appears |
+| Monaco editor strategy | **VS Code extension + Named Pipe**. UIA TextPattern is broken for Monaco; extension provides reliable text extraction |
 
 ---
 
@@ -34,6 +36,7 @@ The project has completed its migration from a standalone CLI (`command/`) to a 
 - **Frontend**: Vue 3.5+, TypeScript ~5.6, Vite 6
 - **Desktop framework**: Tauri v2 (Rust edition 2021)
 - **Core engine**: Rust, Win32 FFI, Windows UI Automation
+- **VS Code extension**: TypeScript, Named Pipe IPC
 - **Package manager**: pnpm
 - **Platform**: Windows only (relies heavily on Win32 APIs)
 
@@ -63,6 +66,12 @@ The project has completed its migration from a standalone CLI (`command/`) to a 
 │   ├── tauri.conf.json     # Tauri configuration (identifier: com.lanxiuyun.smart-shift)
 │   ├── build.rs            # tauri_build::build()
 │   └── capabilities/       # Permission scopes
+├── vscode-extension/       # VS Code extension for Monaco editor text extraction
+│   ├── src/
+│   │   └── extension.ts    # Named Pipe server, editor content exposure
+│   ├── package.json        # Extension metadata
+│   ├── tsconfig.json       # TypeScript configuration
+│   └── README.md           # Extension documentation
 ├── command/                # (LEGACY) Old standalone CLI — to be removed
 │   └── ...
 ├── package.json            # Frontend dependencies and scripts
@@ -110,6 +119,21 @@ cargo test
 cargo build --release
 ```
 
+### VS Code Extension (`vscode-extension/` directory)
+
+```bash
+cd vscode-extension
+
+# Install dependencies
+npm install
+
+# Compile TypeScript
+npm run compile
+
+# Package as .vsix
+vsce package
+```
+
 ---
 
 ## Code Style Guidelines
@@ -139,7 +163,7 @@ The project uses standard `cargo test` with extensive inline `#[cfg(test)]` modu
 
 Tests exist in:
 - `src-tauri/src/classifier.rs` — classification logic tests (CJK detection, neighbor bias, fallback)
-- `src-tauri/src/platform/windows.rs` — 40+ tests covering:
+- `src-tauri/src/platform/windows.rs` — 60+ tests covering:
   - Snapshot transition classification (emit/ignore/suppress)
   - App adapter selection (Chromium/Electron)
   - Ghost character stripping
@@ -147,6 +171,9 @@ Tests exist in:
   - IME mode mapping and target HWND resolution
   - Watcher switch logic
   - Tray runtime control and Win32 message parsing
+  - VS Code extension Named Pipe client
+  - IME composition detection
+  - Typing detection and suppression
 
 Run all tests:
 ```bash
@@ -167,12 +194,18 @@ cd src-tauri && cargo test
 2. **Platform layer** (`platform/windows.rs`): All Win32 API interaction, I/O, text extraction, IME control, and watcher event emission.
 3. **Integration layer** (`lib.rs`): Tauri `Builder` setup, tray configuration, watcher thread spawn, Tauri Commands, and `AppHandle` event emission bridge.
 
-### Text Snapshot Sources
+### Text Snapshot Sources (Priority Order)
 
-The foreground watcher supports multiple text extraction strategies:
-- `win32_edit`: Win32 Edit/RichEdit controls via `EM_*` messages
-- `uia_text_pattern`: Windows UI Automation `TextPattern`
-- `app_adapter`: Chromium/Electron adapter (`Chrome_WidgetWin_1` for VS Code, Cursor, Obsidian) with ghost-character cleanup
+The foreground watcher tries multiple text extraction strategies in order:
+
+1. **`vscode_extension`**: VS Code extension via Named Pipe (`\\.\pipe\smart-shift-vscode`). Highest priority for Monaco editors (VS Code, Cursor, Obsidian). Returns line text, cursor position, and IME composition state.
+2. **`win32_edit`**: Win32 Edit/RichEdit controls via `EM_*` messages.
+3. **`app_adapter`**: Chromium/Electron adapter (`Chrome_WidgetWin_1` for VS Code, Cursor, Obsidian) with ghost-character cleanup. **Known issue**: UIA TextPattern returns single characters for Monaco editors.
+4. **`uia_text_pattern`**: Windows UI Automation `TextPattern` fallback.
+
+### IME Composition Detection
+
+The watcher uses `ImmGetCompositionStringW` with `GCS_COMPSTR` to detect if the user is actively composing (e.g., typing pinyin). When composition is detected, the watcher skips IME switching to avoid interrupting the input flow.
 
 ### IME Switch Path (fallback chain)
 
@@ -187,9 +220,13 @@ The foreground watcher supports multiple text extraction strategies:
 ```
 ForegroundWatcher::run_until_controlled
   └── capture_foreground_snapshot
-        └── classify_snapshot / should_preserve_current_mode / maybe_switch_watcher_mode
-              └── AppHandle::emit("watcher-event", WatcherEvent)
-                    └── Vue frontend: listen("watcher-event", handler)
+        └── is_ime_composing? → skip if true
+              └── classify_snapshot_transition_with_state
+                    └── looks_like_typing? → suppress if true
+                          └── looks_like_ime_composition? → suppress if true
+                                └── classify_snapshot / should_preserve_current_mode / maybe_switch_watcher_mode
+                                      └── AppHandle::emit("watcher-event", WatcherEvent)
+                                            └── Vue frontend: listen("watcher-event", handler)
 ```
 
 ---
@@ -216,6 +253,7 @@ The watcher polls on an interval and must **only emit on cursor/focus relocation
 - Pressing `Enter` to create a new blank line
 - IME commit that changes document length without a line relocation
 - Manual IME mode toggle by itself (e.g., pressing `Shift`)
+- **IME composition** (pinyin input, Japanese IME, etc.)
 
 ### Weak Signal Protection
 
@@ -228,6 +266,25 @@ For UIA `TextPattern`, `line_index` and cursor offsets follow `TextUnit_Line`, n
 ### App Adapter Selection
 
 Chromium/Electron adapters are selected by **control class plus process name** (not class alone), to avoid matching every browser window.
+
+### VS Code Extension Protocol
+
+The VS Code extension communicates via Named Pipe (`\\.\pipe\smart-shift-vscode`):
+
+**Requests:**
+- `GET_LINE` — Get current line information
+- `PING` — Health check
+
+**Responses:**
+```json
+{
+  "line": "const x = 1;",
+  "cursor": 5,
+  "lineNumber": 10,
+  "totalLines": 100,
+  "composing": false
+}
+```
 
 ---
 
@@ -260,3 +317,5 @@ Chromium/Electron adapters are selected by **control class plus process name** (
 - The project uses `cargo` for Rust and `pnpm` for Node. Do not mix package managers.
 - The `tray-icon` Tauri feature is required for system tray support; do not remove it from `Cargo.toml`.
 - `WatcherEvent` is emitted on every watcher trigger; when adding new fields, update both the Rust struct and the Vue listener.
+- **VS Code extension** is required for Monaco editor support. The extension must be installed separately by the user.
+- **IME composition detection** uses `ImmGetCompositionStringW` with `GCS_COMPSTR`. This is the most reliable way to detect if the user is actively typing in an IME.
