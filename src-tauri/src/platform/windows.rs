@@ -1,7 +1,9 @@
 use crate::classifier::{classify, Decision, DecisionReason};
+use crate::config::AppConfig;
 use crate::context::LineContext;
 use crate::ime::InputMode;
 use crate::logger::EventLogger;
+use std::sync::RwLock;
 use std::ffi::c_void;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -77,6 +79,10 @@ impl TrayRuntimeControl {
         self.paused.store(new_state, Ordering::Relaxed);
         new_state
     }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
 }
 
 impl WindowsSingleInstance {
@@ -151,6 +157,7 @@ pub struct WatcherEvent {
 pub struct ForegroundWatcher {
     interval: Duration,
     debug: Arc<AtomicBool>,
+    app_config: Arc<RwLock<AppConfig>>,
     app_handle: Option<tauri::AppHandle>,
     event_logger: Option<Arc<EventLogger>>,
 }
@@ -173,12 +180,14 @@ impl ForegroundWatcher {
     pub fn new(
         interval_ms: u64,
         debug: Arc<AtomicBool>,
+        app_config: Arc<RwLock<AppConfig>>,
         app_handle: Option<tauri::AppHandle>,
         event_logger: Option<Arc<EventLogger>>,
     ) -> Self {
         Self {
             interval: Duration::from_millis(interval_ms.max(50)),
             debug,
+            app_config,
             app_handle,
             event_logger,
         }
@@ -225,6 +234,15 @@ impl ForegroundWatcher {
             match capture_foreground_snapshot() {
                 Ok(snapshot) => {
                     last_error = None;
+
+                    // Check blacklist / whitelist
+                    if let Ok(cfg) = self.app_config.read() {
+                        if !cfg.is_app_allowed(&snapshot.process_name) {
+                            last_snapshot = Some(snapshot);
+                            thread::sleep(self.interval);
+                            continue;
+                        }
+                    }
 
                     // Skip IME switching if the user is actively composing (pinyin input, etc.)
                     if is_ime_composing(snapshot.focus_hwnd as HWND) {
@@ -425,6 +443,16 @@ fn classify_snapshot_transition_with_state(
     }
 
     if cursor_changed || caret_changed {
+        // Detect UIA lag where cursor jumps from end-of-line to start but line_index didn't update.
+        // This happens in some editors when moving across a newline; ignoring prevents
+        // re-classifying the old line content after the cursor has already left.
+        if previous_text.line_index == current_text.line_index
+            && previous_text.line_text == current_text.line_text
+            && previous_text.line_cursor_chars == previous_text.line_text.chars().count()
+            && current_text.line_cursor_chars == 0
+        {
+            return SnapshotTransition::Ignore;
+        }
         SnapshotTransition::Emit
     } else {
         SnapshotTransition::Ignore
@@ -1265,15 +1293,45 @@ fn uia_range_to_line_snapshot(
     let line_prefix_utf16 = line_prefix_text.encode_utf16().count();
     let line_prefix_chars = line_prefix_text.chars().count();
 
+    // Logical line extraction for wrapped text (non-adapter UIA only).
+    // UIA TextUnit_Line returns physical visible lines; for editors with soft wrap,
+    // we prefer the logical line (between \n boundaries) so the classifier sees
+    // the full line context rather than a fragment.
+    let (final_line_text, final_cursor_chars, final_cursor_utf16) =
+        if adapter.is_none() && document_text.contains('\n') {
+            let cursor_offset = document_prefix_text.chars().count();
+            let chars: Vec<char> = document_text.chars().collect();
+            let line_start = chars[..cursor_offset.min(chars.len())]
+                .iter()
+                .rposition(|&ch| ch == '\n')
+                .map(|pos| pos + 1)
+                .unwrap_or(0);
+            let line_end = chars[cursor_offset..]
+                .iter()
+                .position(|&ch| ch == '\n')
+                .map(|pos| cursor_offset + pos)
+                .unwrap_or(chars.len());
+            let logical_line: String = chars[line_start..line_end].iter().collect();
+            let cursor_in_line = cursor_offset.saturating_sub(line_start);
+            let cursor_in_line_utf16 = logical_line[..cursor_in_line.min(logical_line.len())]
+                .chars()
+                .collect::<String>()
+                .encode_utf16()
+                .count();
+            (logical_line, cursor_in_line, cursor_in_line_utf16)
+        } else {
+            (line_text, line_prefix_chars, line_prefix_utf16)
+        };
+
     Ok(TextSnapshot {
         source: "uia_text_pattern",
         document_len_utf16,
         selection_start_utf16,
         selection_end_utf16,
         line_index,
-        line_cursor_utf16: line_prefix_utf16,
-        line_cursor_chars: line_prefix_chars,
-        line_text,
+        line_cursor_utf16: final_cursor_utf16,
+        line_cursor_chars: final_cursor_chars,
+        line_text: final_line_text,
         attempts: Vec::new(),
     })
 }

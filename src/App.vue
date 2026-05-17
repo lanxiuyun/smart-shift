@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openPath } from "@tauri-apps/plugin-opener";
 
 type WatcherStatus = {
   paused: boolean;
@@ -37,6 +38,14 @@ type ClassificationResult = {
   reason: string;
 };
 
+type AppConfig = {
+  poll_interval_ms: number;
+  debug_mode: boolean;
+  auto_start: boolean;
+  blacklist: string[];
+  whitelist_mode: boolean;
+};
+
 const status = ref<WatcherStatus>({ paused: false });
 const imeMode = ref("unknown");
 const debugMode = ref(false);
@@ -45,11 +54,22 @@ const testLine = ref("hello world");
 const testCursor = ref(0);
 const testResult = ref<ClassificationResult | null>(null);
 const error = ref("");
+const startupErrors = ref<string[]>([]);
 const liveLogs = ref<WatcherEventPayload[]>([]);
 const maxLiveLogs = 100;
 
+const config = ref<AppConfig>({
+  poll_interval_ms: 250,
+  debug_mode: false,
+  auto_start: true,
+  blacklist: [],
+  whitelist_mode: false,
+});
+const newBlacklistItem = ref("");
+
 let pollTimer: number | null = null;
 let unlistenWatcher: (() => void) | null = null;
+let unlistenStartup: (() => void) | null = null;
 
 function formatError(errorLike: unknown): string {
   if (errorLike instanceof Error) {
@@ -83,6 +103,45 @@ async function fetchDebugMode() {
   }
 }
 
+async function fetchConfig() {
+  try {
+    config.value = await invoke<AppConfig>("get_config");
+    error.value = "";
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
+  }
+}
+
+async function saveConfig() {
+  try {
+    await invoke("set_config", { config: config.value });
+    error.value = "";
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
+  }
+}
+
+async function resetConfig() {
+  try {
+    config.value = await invoke<AppConfig>("reset_config");
+    error.value = "";
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
+  }
+}
+
+function addBlacklistItem() {
+  const name = newBlacklistItem.value.trim();
+  if (name && !config.value.blacklist.includes(name)) {
+    config.value.blacklist.push(name);
+    newBlacklistItem.value = "";
+  }
+}
+
+function removeBlacklistItem(index: number) {
+  config.value.blacklist.splice(index, 1);
+}
+
 async function toggleDebug() {
   try {
     const enabled = await invoke<boolean>("set_debug_mode", { enabled: !debugMode.value });
@@ -96,6 +155,15 @@ async function toggleDebug() {
 async function fetchLogFilePath() {
   try {
     logFilePath.value = await invoke<string>("get_log_file_path");
+  } catch (errorLike) {
+    error.value = formatError(errorLike);
+  }
+}
+
+async function openLogFolder() {
+  try {
+    await invoke("open_log_folder");
+    error.value = "";
   } catch (errorLike) {
     error.value = formatError(errorLike);
   }
@@ -129,7 +197,13 @@ function clearLiveLogs() {
 }
 
 async function refreshDiagnostics() {
-  await Promise.all([fetchStatus(), fetchImeMode(), fetchDebugMode(), fetchLogFilePath()]);
+  await Promise.all([
+    fetchStatus(),
+    fetchImeMode(),
+    fetchDebugMode(),
+    fetchConfig(),
+    fetchLogFilePath(),
+  ]);
 }
 
 onMounted(async () => {
@@ -145,6 +219,10 @@ onMounted(async () => {
       liveLogs.value.pop();
     }
   });
+
+  unlistenStartup = await listen<string[]>("startup-check-failed", (event) => {
+    startupErrors.value = event.payload;
+  });
 });
 
 onUnmounted(() => {
@@ -153,6 +231,9 @@ onUnmounted(() => {
   }
   if (unlistenWatcher) {
     unlistenWatcher();
+  }
+  if (unlistenStartup) {
+    unlistenStartup();
   }
 });
 </script>
@@ -168,6 +249,12 @@ onUnmounted(() => {
     </header>
 
     <div v-if="error" class="error">{{ error }}</div>
+    <div v-if="startupErrors.length > 0" class="warning">
+      <strong>Startup check failed:</strong>
+      <ul>
+        <li v-for="(msg, idx) in startupErrors" :key="idx">{{ msg }}</li>
+      </ul>
+    </div>
 
     <section class="card">
       <div class="section-head">
@@ -194,6 +281,61 @@ onUnmounted(() => {
           {{ debugMode ? "Debug: ON" : "Debug: OFF" }}
         </button>
       </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>Configuration</h2>
+        <div class="actions">
+          <button class="btn-secondary" @click="saveConfig">Save</button>
+          <button class="btn-secondary" @click="resetConfig">Reset</button>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label for="poll">Poll interval (ms)</label>
+        <input
+          id="poll"
+          v-model.number="config.poll_interval_ms"
+          type="number"
+          class="input"
+          min="50"
+          max="1000"
+        />
+      </div>
+      <div class="form-row">
+        <label>Auto-start watcher</label>
+        <input v-model="config.auto_start" type="checkbox" />
+      </div>
+      <div class="form-row">
+        <label>Whitelist mode</label>
+        <input v-model="config.whitelist_mode" type="checkbox" />
+      </div>
+
+      <div class="form-row" style="align-items: flex-start;">
+        <label>App list</label>
+        <div style="display: grid; gap: 8px; min-width: 0;">
+          <div style="display: flex; gap: 8px;">
+            <input
+              v-model="newBlacklistItem"
+              class="input"
+              placeholder="Process name, e.g. Wave.exe"
+              @keydown.enter="addBlacklistItem"
+            />
+            <button class="btn-secondary" @click="addBlacklistItem">Add</button>
+          </div>
+          <div v-if="config.blacklist.length > 0" class="tag-list">
+            <span v-for="(item, idx) in config.blacklist" :key="idx" class="tag">
+              {{ item }}
+              <button class="tag-remove" @click="removeBlacklistItem(idx)">×</button>
+            </span>
+          </div>
+          <p v-else class="hint">{{ config.whitelist_mode ? "No whitelist apps configured." : "No blacklist apps configured." }}</p>
+        </div>
+      </div>
+      <p class="hint">
+        Poll interval changes take effect after restart. Blacklist changes are effective immediately.
+      </p>
     </section>
 
     <section class="card">
@@ -227,6 +369,7 @@ onUnmounted(() => {
         <h2>Logs</h2>
         <div class="actions">
           <button class="btn-secondary" @click="clearLiveLogs">Clear live</button>
+          <button class="btn-secondary" @click="openLogFolder">Open folder</button>
         </div>
       </div>
       <p class="path-line">
@@ -526,6 +669,43 @@ h3 {
   border: 1px solid #1c8c5c;
 }
 
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #eef2f7;
+  font-size: 0.84rem;
+  color: #243247;
+}
+
+.tag-remove {
+  border: none;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.tag-remove:hover {
+  color: #991b1b;
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #6b7280;
+}
+
 .log-debug {
   margin-top: 6px;
   padding: 8px 10px;
@@ -534,6 +714,19 @@ h3 {
   font-size: 0.78rem;
   color: #4b5565;
   line-height: 1.6;
+}
+
+.warning {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #fff1d6;
+  color: #9a5a00;
+}
+
+.warning ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
 }
 
 .error {

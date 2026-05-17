@@ -2,7 +2,8 @@ use crate::platform::windows::WatcherEvent;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
@@ -83,6 +84,51 @@ impl EventLogger {
         }
         Ok(lines)
     }
+
+    pub fn append_error(&self, message: &str) -> Result<(), String> {
+        let path = self.log_dir.join("error.log");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create log directory {}: {e}", parent.display()))?;
+        }
+        let timestamp = local_now()
+            .format(&Rfc3339)
+            .map_err(|e| format!("failed to format log timestamp: {e}"))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("failed to open error log {}: {e}", path.display()))?;
+        writeln!(file, "{} {}", timestamp, message)
+            .map_err(|e| format!("failed to write error log: {e}"))?;
+        Ok(())
+    }
+
+    pub fn cleanup_old_logs(&self, retain_days: u64) -> Result<usize, String> {
+        let cutoff = SystemTime::now() - Duration::from_secs(retain_days * 86400);
+        let mut removed = 0usize;
+        if let Ok(entries) = fs::read_dir(&self.log_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("log") {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if modified < cutoff {
+                            let _ = fs::remove_file(&path);
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn log_dir(&self) -> &Path {
+        &self.log_dir
+    }
 }
 
 fn watcher_event_value(event: &WatcherEvent) -> Value {
@@ -95,6 +141,18 @@ fn watcher_event_value(event: &WatcherEvent) -> Value {
         "preserved": event.preserved,
         "reason": event.reason,
         "error": event.error,
+        "debug": event.debug,
+        "window_title": event.window_title,
+        "process_name": event.process_name,
+        "focus_class": event.focus_class,
+        "ime_error": event.ime_error,
+        "caret": event.caret,
+        "doc_len": event.doc_len,
+        "selection_start": event.selection_start,
+        "selection_end": event.selection_end,
+        "line_number": event.line_number,
+        "cursor_utf16": event.cursor_utf16,
+        "cursor_chars": event.cursor_chars,
     })
 }
 
