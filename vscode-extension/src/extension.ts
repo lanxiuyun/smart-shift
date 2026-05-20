@@ -15,50 +15,41 @@ interface LineInfo {
     cursor: number;      // cursor offset within the line (0-based)
     lineNumber: number;   // line number (0-based)
     totalLines: number;
-    composing: boolean;   // whether IME is currently composing
+    composing: boolean;   // whether user is actively typing (IME or fast typing)
 }
 
 let pipeServer: net.Server | null = null;
 let outputChannel: vscode.OutputChannel;
-let isComposing = false;  // Track IME composition state
+let isComposing = false;  // Track active typing to prevent IME mid-switch
+let composingTimer: NodeJS.Timeout | null = null;
+const COMPOSING_DEBOUNCE_MS = 800;
 
 export function activate(context: vscode.ExtensionContext) {
     outputChannel = vscode.window.createOutputChannel('Smart Shift');
     outputChannel.appendLine('Smart Shift extension activating...');
 
-    // Track IME composition state via document change events
-    // When composing, VS Code applies edits that look like replacements at the same position
-    context.subscriptions.push(
-        vscode.window.onDidChangeTextEditorSelection((e) => {
-            // During composition, selections change rapidly
-            // We'll use this as a signal alongside onDidChangeTextDocument
-        })
-    );
-
-    // Listen for text document changes to detect composition
+    // Listen for text document changes to detect active typing / IME composition
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument((e) => {
-            // Check if the change looks like IME composition
-            // VS Code reports composition as contentChanges at the cursor position
-            if (e.contentChanges.length > 0) {
-                const change = e.contentChanges[0];
-                // IME composition typically has replacements (rangeLength > 0) 
-                // or insertions of single characters that are being composed
-                // We mark as composing if text contains characters that look like pinyin input
-                const text = change.text;
-                const isCompositionLike = 
-                    // Replacement at same position (IME updating composition buffer)
-                    (change.rangeLength > 0 && text.length <= change.rangeLength) ||
-                    // Single ASCII character being composed (like 'c', 'e', 's' for pinyin)
-                    (text.length === 1 && /[a-zA-Z']/.test(text) && change.rangeLength === 0);
-                
-                if (isCompositionLike) {
-                    isComposing = true;
-                    // Reset composing state after a short delay (composition will keep triggering)
-                    setTimeout(() => {
-                        isComposing = false;
-                    }, 500);
+            if (e.contentChanges.length === 0) return;
+
+            const change = e.contentChanges[0];
+            const text = change.text;
+
+            // Any text insertion (not pure deletion) means user is actively typing.
+            // During IME composition, VS Code emits rapid replacements/insertions.
+            // We treat all typing as "composing" to prevent the backend from
+            // switching IME mode mid-flight.
+            const isTyping = text.length > 0;
+
+            if (isTyping) {
+                isComposing = true;
+                if (composingTimer) {
+                    clearTimeout(composingTimer);
                 }
+                composingTimer = setTimeout(() => {
+                    isComposing = false;
+                }, COMPOSING_DEBOUNCE_MS);
             }
         })
     );
@@ -72,7 +63,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (editor) {
             const info = getLineInfo(editor);
             vscode.window.showInformationMessage(
-                `Smart Shift: Line ${info.lineNumber + 1}, Cursor ${info.cursor}, "${info.line}"`
+                `Smart Shift: Line ${info.lineNumber + 1}, Cursor ${info.cursor}, composing=${info.composing}`
             );
         } else {
             vscode.window.showInformationMessage('Smart Shift: No active editor');
@@ -96,22 +87,30 @@ function startPipeServer() {
         outputChannel.appendLine('Client connected');
 
         socket.on('data', (data) => {
-            const request = data.toString().trim();
-            outputChannel.appendLine(`Received request: ${request}`);
+            try {
+                const request = data.toString().trim();
+                outputChannel.appendLine(`Received request: ${request}`);
 
-            if (request === 'GET_LINE') {
-                const editor = vscode.window.activeTextEditor;
-                if (editor) {
-                    const info = getLineInfo(editor);
-                    const response = JSON.stringify(info);
-                    outputChannel.appendLine(`Sending response: ${response}`);
-                    socket.write(response + '\n');
-                } else {
-                    const errorResponse = JSON.stringify({ error: 'no_editor' });
-                    socket.write(errorResponse + '\n');
+                if (request === 'GET_LINE') {
+                    const editor = vscode.window.activeTextEditor;
+                    if (editor) {
+                        const info = getLineInfo(editor);
+                        const response = JSON.stringify(info);
+                        outputChannel.appendLine(`Sending response: ${response}`);
+                        socket.write(response + '\n');
+                    } else {
+                        const errorResponse = JSON.stringify({ error: 'no_editor' });
+                        socket.write(errorResponse + '\n');
+                    }
+                } else if (request === 'PING') {
+                    socket.write('PONG\n');
                 }
-            } else if (request === 'PING') {
-                socket.write('PONG\n');
+                // Gracefully end the socket after responding so the client
+                // sees EOF and can close its handle cleanly.
+                socket.end();
+            } catch (err) {
+                outputChannel.appendLine(`Socket handler error: ${err}`);
+                socket.destroy();
             }
         });
 
@@ -162,6 +161,11 @@ function getLineInfo(editor: vscode.TextEditor): LineInfo {
 
 export function deactivate() {
     outputChannel.appendLine('Smart Shift extension deactivating...');
+
+    if (composingTimer) {
+        clearTimeout(composingTimer);
+        composingTimer = null;
+    }
 
     if (pipeServer) {
         pipeServer.close();

@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "vue-tsc --noEmit && vite build && npm run build:extension",
+    "build:extension": "cd vscode-extension && npx vsce package --no-dependencies",
     "preview": "vite preview",
     "tauri": "tauri"
   },

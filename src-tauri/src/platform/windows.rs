@@ -1409,62 +1409,74 @@ fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, Tex
         return Err(TextReadResult::Unsupported("not_vscode_editor"));
     }
 
-    let mut pipe = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(VSCODE_PIPE_PATH)
-        .map_err(|_| TextReadResult::Failed("pipe_connect_failed"))?;
+    let pipe_path = VSCODE_PIPE_PATH.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
 
-    // Send request
-    pipe.write_all(b"GET_LINE\n")
-        .map_err(|_| TextReadResult::Failed("pipe_write_failed"))?;
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut pipe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pipe_path)
+                .map_err(|_| TextReadResult::Failed("pipe_connect_failed"))?;
 
-    // Read response with timeout
-    let mut response = String::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = pipe.read(&mut buf).map_err(|_| TextReadResult::Failed("pipe_read_failed"))?;
-        if n == 0 {
-            break;
-        }
-        response.push_str(&String::from_utf8_lossy(&buf[..n]));
-        if response.contains('\n') {
-            break;
-        }
+            // Send request
+            pipe.write_all(b"GET_LINE\n")
+                .map_err(|_| TextReadResult::Failed("pipe_write_failed"))?;
+
+            let mut response = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = pipe.read(&mut buf).map_err(|_| TextReadResult::Failed("pipe_read_failed"))?;
+                if n == 0 {
+                    break;
+                }
+                response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if response.contains('\n') {
+                    break;
+                }
+            }
+
+            let response = response.trim();
+
+            // Check for error response
+            if response.contains("\"error\"") {
+                return Err(TextReadResult::Failed("vscode_no_editor"));
+            }
+
+            let vs_response: VsCodeLineResponse =
+                serde_json::from_str(response).map_err(|_| TextReadResult::Failed("pipe_parse_failed"))?;
+
+            // If IME is composing, return a weak signal to prevent mode switching
+            if vs_response.composing {
+                return Err(TextReadResult::Failed("ime_composing"));
+            }
+
+            let line_text = vs_response.line;
+            let cursor_chars = vs_response.cursor;
+            let line_cursor_utf16 = line_text[..line_text.chars().take(cursor_chars).collect::<String>().len()]
+                .encode_utf16()
+                .count();
+
+            Ok(TextSnapshot {
+                source: "vscode_extension",
+                document_len_utf16: 0, // Not available from extension
+                selection_start_utf16: 0,
+                selection_end_utf16: 0,
+                line_index: vs_response.line_number,
+                line_cursor_utf16,
+                line_cursor_chars: cursor_chars,
+                line_text,
+                attempts: Vec::new(),
+            })
+        })();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_millis(500)) {
+        Ok(result) => result,
+        Err(_) => Err(TextReadResult::Failed("pipe_timeout")),
     }
-
-    let response = response.trim();
-
-    // Check for error response
-    if response.contains("\"error\"") {
-        return Err(TextReadResult::Failed("vscode_no_editor"));
-    }
-
-    let vs_response: VsCodeLineResponse =
-        serde_json::from_str(response).map_err(|_| TextReadResult::Failed("pipe_parse_failed"))?;
-
-    // If IME is composing, return a weak signal to prevent mode switching
-    if vs_response.composing {
-        return Err(TextReadResult::Failed("ime_composing"));
-    }
-
-    let line_text = vs_response.line;
-    let cursor_chars = vs_response.cursor;
-    let line_cursor_utf16 = line_text[..line_text.chars().take(cursor_chars).collect::<String>().len()]
-        .encode_utf16()
-        .count();
-
-    Ok(TextSnapshot {
-        source: "vscode_extension",
-        document_len_utf16: 0, // Not available from extension
-        selection_start_utf16: 0,
-        selection_end_utf16: 0,
-        line_index: vs_response.line_number,
-        line_cursor_utf16,
-        line_cursor_chars: cursor_chars,
-        line_text,
-        attempts: Vec::new(),
-    })
 }
 
 fn uia_line_index(
