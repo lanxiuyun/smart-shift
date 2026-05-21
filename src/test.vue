@@ -8,8 +8,8 @@ const multiLineText = `
 请将光标移动到这里时，变成中文
 when the cursor moves here, it becomes English
 
-请将光标移动到这里时，变成中文
-when the cursor moves here, it becomes English
+请将光标移zz动到zzz这里时，变成中文
+when the curzzsor moves here, it becomes English
 
 请将光标移动到这里时，变成中文
 when the cursor moves here, it becomes English

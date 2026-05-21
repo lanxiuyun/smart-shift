@@ -48,7 +48,23 @@ let pipeServer = null;
 let outputChannel;
 let isComposing = false; // Track active typing to prevent IME mid-switch
 let composingTimer = null;
-const COMPOSING_DEBOUNCE_MS = 300;
+const COMPOSING_DEBOUNCE_MS = 5000;
+/** Check if a character is a CJK ideograph (basic + ext A) */
+function isCjk(ch) {
+    const code = ch.charCodeAt(0);
+    return (code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF);
+}
+/** Check whether the character before the cursor looks like an active pinyin composition */
+function looksLikePinyinComposition(lineText, cursor) {
+    if (cursor <= 0 || cursor > lineText.length)
+        return false;
+    const prevChar = lineText.charAt(cursor - 1);
+    if (!prevChar.match(/[a-z]/))
+        return false;
+    const beforePrev = cursor >= 2 ? lineText.charAt(cursor - 2) : '';
+    const afterCurr = cursor < lineText.length ? lineText.charAt(cursor) : '';
+    return isCjk(beforePrev) || isCjk(afterCurr);
+}
 function activate(context) {
     outputChannel = vscode.window.createOutputChannel('Smart Shift');
     outputChannel.appendLine('Smart Shift extension activating...');
@@ -64,13 +80,19 @@ function activate(context) {
         // switching IME mode mid-flight.
         const isTyping = text.length > 0;
         if (isTyping) {
-            isComposing = true;
-            if (composingTimer) {
-                clearTimeout(composingTimer);
-            }
-            composingTimer = setTimeout(() => {
-                isComposing = false;
-            }, COMPOSING_DEBOUNCE_MS);
+            setComposing(true);
+        }
+    }));
+    // Also keep composing alive when the cursor moves inside an active pinyin block
+    // (e.g. Microsoft Pinyin preview shifts the cursor without emitting text changes).
+    context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection((e) => {
+        if (!isComposing)
+            return;
+        const editor = e.textEditor;
+        const position = editor.selection.active;
+        const line = editor.document.lineAt(position.line);
+        if (looksLikePinyinComposition(line.text, position.character)) {
+            setComposing(true);
         }
     }));
     // Start Named Pipe server
@@ -145,6 +167,18 @@ function startPipeServer() {
     }
     else {
         pipeServer.listen(PIPE_PATH);
+    }
+}
+function setComposing(value) {
+    isComposing = value;
+    if (composingTimer) {
+        clearTimeout(composingTimer);
+        composingTimer = null;
+    }
+    if (value) {
+        composingTimer = setTimeout(() => {
+            isComposing = false;
+        }, COMPOSING_DEBOUNCE_MS);
     }
 }
 function getLineInfo(editor) {

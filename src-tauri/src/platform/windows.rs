@@ -447,6 +447,13 @@ fn classify_snapshot_transition_with_state(
     }
 
     if cursor_changed || caret_changed {
+        // Safety net: if the current line contains an active pinyin composition,
+        // suppress switching even when only the cursor moved (e.g. Microsoft Pinyin
+        // preview shifts cursor without changing line_text).
+        if looks_like_active_pinyin_composition(current_text) {
+            return SnapshotTransition::Ignore;
+        }
+
         // Detect UIA lag where cursor jumps from end-of-line to start but line_index didn't update.
         // This happens in some editors when moving across a newline; ignoring prevents
         // re-classifying the old line content after the cursor has already left.
@@ -592,6 +599,57 @@ fn looks_like_ime_composition(previous: &TextSnapshot, current: &TextSnapshot) -
             let inserted = &curr_chars[cursor..cursor + inserted_count];
             return !inserted.is_empty()
                 && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+        }
+    }
+
+    // Case 3: cursor is inside the inserted block (some IMEs place cursor
+    // within the composition string rather than at start or end).
+    if cursor > prev_cursor && cursor < prev_cursor + inserted_count {
+        let insert_start = prev_cursor;
+        if insert_start <= prev_len
+            && curr_chars[..insert_start] == prev_chars[..insert_start]
+            && curr_chars[prev_cursor + inserted_count..] == prev_chars[insert_start..]
+        {
+            let inserted = &curr_chars[insert_start..prev_cursor + inserted_count];
+            return !inserted.is_empty()
+                && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+        }
+    }
+
+    false
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF
+            | 0x3400..=0x4DBF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+            | 0xF900..=0xFAFF
+            | 0x2F800..=0x2FA1F
+    )
+}
+
+/// Detect if the current line text itself looks like it contains an active
+/// pinyin composition block (lowercase ASCII surrounded by CJK characters).
+/// This is used as a fallback when the VS Code extension reports composing=false
+/// but the line text clearly still contains unfinished pinyin.
+fn looks_like_active_pinyin_composition(snapshot: &TextSnapshot) -> bool {
+    let chars: Vec<char> = snapshot.line_text.chars().collect();
+    if chars.is_empty() {
+        return false;
+    }
+
+    for i in 0..chars.len() {
+        if chars[i].is_ascii_lowercase() {
+            let prev_is_cjk = i > 0 && is_cjk(chars[i - 1]);
+            let next_is_cjk = i + 1 < chars.len() && is_cjk(chars[i + 1]);
+            if prev_is_cjk || next_is_cjk {
+                return true;
+            }
         }
     }
 
@@ -3057,5 +3115,102 @@ mod tests {
         assert_eq!(response.cursor, 8);
         assert_eq!(response.document_offset, 20);
         assert_eq!(response.document_length, 100);
+    }
+
+    #[test]
+    fn detects_ime_composition_when_cursor_is_inside_insertion() {
+        // Some IMEs place the cursor inside the composition string.
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 2,
+            selection_end_utf16: 2,
+            line_index: 0,
+            line_cursor_utf16: 2,
+            line_cursor_chars: 2,
+            line_text: "变成中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 13,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成ces中文".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
+    fn ignores_transition_when_cursor_moves_inside_pinyin_composition() {
+        // Cursor moves inside a pinyin block without line_text changing.
+        let mut previous = snapshot("变成ces中文");
+        previous.text_snapshot.line_cursor_chars = 4;
+        previous.text_snapshot.line_cursor_utf16 = 4;
+        previous.text_snapshot.selection_start_utf16 = 4;
+        previous.text_snapshot.selection_end_utf16 = 4;
+
+        let mut current = snapshot("变成ces中文");
+        current.text_snapshot.line_cursor_chars = 5;
+        current.text_snapshot.line_cursor_utf16 = 5;
+        current.text_snapshot.selection_start_utf16 = 5;
+        current.text_snapshot.selection_end_utf16 = 5;
+
+        assert_eq!(
+            super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
+            super::SnapshotTransition::Ignore
+        );
+    }
+
+    #[test]
+    fn detects_active_pinyin_for_mixed_cjk_ascii_line() {
+        let snapshot = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 0,
+            selection_end_utf16: 0,
+            line_index: 0,
+            line_cursor_utf16: 0,
+            line_cursor_chars: 0,
+            line_text: "中文ces中文".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(super::looks_like_active_pinyin_composition(&snapshot));
+    }
+
+    #[test]
+    fn rejects_active_pinyin_for_pure_english_line() {
+        let snapshot = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 0,
+            selection_end_utf16: 0,
+            line_index: 0,
+            line_cursor_utf16: 0,
+            line_cursor_chars: 0,
+            line_text: "hello world".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(!super::looks_like_active_pinyin_composition(&snapshot));
+    }
+
+    #[test]
+    fn rejects_active_pinyin_for_pure_cjk_line() {
+        let snapshot = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 0,
+            selection_end_utf16: 0,
+            line_index: 0,
+            line_cursor_utf16: 0,
+            line_cursor_chars: 0,
+            line_text: "变成中文".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(!super::looks_like_active_pinyin_composition(&snapshot));
     }
 }
