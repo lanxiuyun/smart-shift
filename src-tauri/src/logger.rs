@@ -190,6 +190,18 @@ mod tests {
             preserved: false,
             reason: "neighbor_cjk".to_string(),
             error: None,
+            debug: false,
+            window_title: None,
+            process_name: None,
+            focus_class: None,
+            ime_error: None,
+            caret: None,
+            doc_len: None,
+            selection_start: None,
+            selection_end: None,
+            line_number: None,
+            cursor_utf16: None,
+            cursor_chars: None,
         }
     }
 

@@ -48,7 +48,7 @@ let pipeServer = null;
 let outputChannel;
 let isComposing = false; // Track active typing to prevent IME mid-switch
 let composingTimer = null;
-const COMPOSING_DEBOUNCE_MS = 800;
+const COMPOSING_DEBOUNCE_MS = 300;
 function activate(context) {
     outputChannel = vscode.window.createOutputChannel('Smart Shift');
     outputChannel.appendLine('Smart Shift extension activating...');
@@ -97,17 +97,14 @@ function startPipeServer() {
         pipeServer.close();
     }
     pipeServer = net.createServer((socket) => {
-        outputChannel.appendLine('Client connected');
         socket.on('data', (data) => {
             try {
                 const request = data.toString().trim();
-                outputChannel.appendLine(`Received request: ${request}`);
                 if (request === 'GET_LINE') {
                     const editor = vscode.window.activeTextEditor;
                     if (editor) {
                         const info = getLineInfo(editor);
                         const response = JSON.stringify(info);
-                        outputChannel.appendLine(`Sending response: ${response}`);
                         socket.write(response + '\n');
                     }
                     else {
@@ -118,9 +115,7 @@ function startPipeServer() {
                 else if (request === 'PING') {
                     socket.write('PONG\n');
                 }
-                // Gracefully end the socket after responding so the client
-                // sees EOF and can close its handle cleanly.
-                socket.end();
+                // Keep socket alive for subsequent requests (long-lived pipe)
             }
             catch (err) {
                 outputChannel.appendLine(`Socket handler error: ${err}`);
@@ -129,9 +124,6 @@ function startPipeServer() {
         });
         socket.on('error', (err) => {
             outputChannel.appendLine(`Socket error: ${err.message}`);
-        });
-        socket.on('close', () => {
-            outputChannel.appendLine('Client disconnected');
         });
     });
     pipeServer.on('error', (err) => {
@@ -165,7 +157,9 @@ function getLineInfo(editor) {
         cursor: position.character,
         lineNumber: position.line,
         totalLines: document.lineCount,
-        composing: isComposing
+        composing: isComposing,
+        documentOffset: document.offsetAt(position),
+        documentLength: document.getText().length
     };
 }
 function deactivate() {

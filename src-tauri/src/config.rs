@@ -16,7 +16,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            poll_interval_ms: 250,
+            poll_interval_ms: 50,
             debug_mode: false,
             auto_start: true,
             blacklist: Vec::new(),

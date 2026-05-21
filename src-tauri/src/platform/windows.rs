@@ -245,7 +245,9 @@ impl ForegroundWatcher {
                     }
 
                     // Skip IME switching if the user is actively composing (pinyin input, etc.)
-                    if is_ime_composing(snapshot.focus_hwnd as HWND) {
+                    if is_ime_composing(snapshot.focus_hwnd as HWND)
+                        || snapshot.text_snapshot.source == "vscode_extension_composing"
+                    {
                         last_snapshot = Some(snapshot);
                         thread::sleep(self.interval);
                         continue;
@@ -304,7 +306,9 @@ impl ForegroundWatcher {
                     last_error = None;
 
                     // Skip IME switching if the user is actively composing
-                    if is_ime_composing(snapshot.focus_hwnd as HWND) {
+                    if is_ime_composing(snapshot.focus_hwnd as HWND)
+                        || snapshot.text_snapshot.source == "vscode_extension_composing"
+                    {
                         last_snapshot = Some(snapshot);
                         thread::sleep(self.interval);
                         continue;
@@ -543,6 +547,8 @@ fn looks_like_typing(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
 /// This checks that the previous line text is a prefix of the current line text,
 /// and the inserted part consists of lowercase ASCII letters or apostrophes.
 /// For example: "变成中文" → "变成ces中文" (inserted "ces" before "中文")
+/// Also handles IME composition preview where the cursor stays at the insertion
+/// start (e.g. Microsoft Pinyin in VS Code).
 fn looks_like_ime_composition(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
     // Must be on the same line
     if previous.line_index != current.line_index {
@@ -561,36 +567,35 @@ fn looks_like_ime_composition(previous: &TextSnapshot, current: &TextSnapshot) -
     }
 
     let inserted_count = curr_len - prev_len;
-
-    // Find where the insertion happened by comparing prefix and suffix
-    // The cursor position in the current line tells us where the insertion is
     let cursor = current.line_cursor_chars;
+    let prev_cursor = previous.line_cursor_chars;
 
-    // Insertion should be at or near the cursor
-    // Check that the text before the insertion point matches
-    if cursor < inserted_count {
-        return false;
+    // Case 1: cursor moved to end of insertion (normal typing / some IMEs)
+    if cursor == prev_cursor + inserted_count {
+        let insert_start = prev_cursor;
+        if insert_start <= prev_len
+            && curr_chars[..insert_start] == prev_chars[..insert_start]
+            && curr_chars[cursor..] == prev_chars[insert_start..]
+        {
+            let inserted = &curr_chars[insert_start..cursor];
+            return !inserted.is_empty()
+                && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+        }
     }
 
-    let insert_start = cursor - inserted_count;
-
-    // Verify prefix matches
-    if curr_chars[..insert_start] != prev_chars[..insert_start] {
-        return false;
+    // Case 2: cursor stayed at insertion start (IME composition preview)
+    if cursor == prev_cursor {
+        if cursor <= prev_len
+            && curr_chars[..cursor] == prev_chars[..cursor]
+            && curr_chars[cursor + inserted_count..] == prev_chars[cursor..]
+        {
+            let inserted = &curr_chars[cursor..cursor + inserted_count];
+            return !inserted.is_empty()
+                && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+        }
     }
 
-    // Verify suffix matches
-    if curr_chars[cursor..] != prev_chars[insert_start..] {
-        return false;
-    }
-
-    // Check that all inserted characters are lowercase ASCII or apostrophe
-    let inserted = &curr_chars[insert_start..cursor];
-    if inserted.is_empty() {
-        return false;
-    }
-
-    inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'')
+    false
 }
 
 fn is_weak_signal_line(snapshot: &TextSnapshot) -> bool {
@@ -1399,42 +1404,66 @@ struct VsCodeLineResponse {
     total_lines: usize,
     #[serde(default)]
     composing: bool,
+    #[serde(rename = "documentOffset")]
+    document_offset: usize,
+    #[serde(rename = "documentLength")]
+    document_length: usize,
 }
 
+use std::sync::{Mutex, OnceLock};
+
+static VSCODE_PIPE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+
 /// Try to read current line from VS Code extension via Named Pipe.
-/// This is a fallback for Monaco editors (VS Code, Cursor) where UIA TextPattern is broken.
+/// Reuses a cached pipe connection to avoid reconnect overhead on every poll.
 fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, TextReadResult> {
     // Only try for known VS Code-based editors
     if !matches_known_chromium_editor_process(process_name) {
         return Err(TextReadResult::Unsupported("not_vscode_editor"));
     }
 
-    let pipe_path = VSCODE_PIPE_PATH.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
         let result = (|| {
-            let mut pipe = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&pipe_path)
-                .map_err(|_| TextReadResult::Failed("pipe_connect_failed"))?;
+            // Take cached connection or create a new one
+            let mut pipe = {
+                let mut guard = VSCODE_PIPE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+                guard.take()
+            };
+            if pipe.is_none() {
+                pipe = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(VSCODE_PIPE_PATH)
+                    .ok();
+            }
+            let Some(ref mut p) = pipe else {
+                return Err(TextReadResult::Failed("pipe_connect_failed"));
+            };
 
-            // Send request
-            pipe.write_all(b"GET_LINE\n")
+            p.write_all(b"GET_LINE\n")
                 .map_err(|_| TextReadResult::Failed("pipe_write_failed"))?;
 
             let mut response = String::new();
             let mut buf = [0u8; 4096];
             loop {
-                let n = pipe.read(&mut buf).map_err(|_| TextReadResult::Failed("pipe_read_failed"))?;
-                if n == 0 {
-                    break;
+                match p.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if response.contains('\n') {
+                            break;
+                        }
+                    }
+                    Err(_) => return Err(TextReadResult::Failed("pipe_read_failed")),
                 }
-                response.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if response.contains('\n') {
-                    break;
-                }
+            }
+
+            // Put connection back into cache for reuse
+            {
+                let mut guard = VSCODE_PIPE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+                *guard = pipe;
             }
 
             let response = response.trim();
@@ -1447,22 +1476,33 @@ fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, Tex
             let vs_response: VsCodeLineResponse =
                 serde_json::from_str(response).map_err(|_| TextReadResult::Failed("pipe_parse_failed"))?;
 
-            // If IME is composing, return a weak signal to prevent mode switching
-            if vs_response.composing {
-                return Err(TextReadResult::Failed("ime_composing"));
-            }
-
             let line_text = vs_response.line;
             let cursor_chars = vs_response.cursor;
             let line_cursor_utf16 = line_text[..line_text.chars().take(cursor_chars).collect::<String>().len()]
                 .encode_utf16()
                 .count();
 
+            // If IME is composing, mark source so the watcher skips switching
+            // instead of falling back to unreliable adapters.
+            if vs_response.composing {
+                return Ok(TextSnapshot {
+                    source: "vscode_extension_composing",
+                    document_len_utf16: vs_response.document_length,
+                    selection_start_utf16: vs_response.document_offset,
+                    selection_end_utf16: vs_response.document_offset,
+                    line_index: vs_response.line_number,
+                    line_cursor_utf16,
+                    line_cursor_chars: cursor_chars,
+                    line_text,
+                    attempts: Vec::new(),
+                });
+            }
+
             Ok(TextSnapshot {
                 source: "vscode_extension",
-                document_len_utf16: 0, // Not available from extension
-                selection_start_utf16: 0,
-                selection_end_utf16: 0,
+                document_len_utf16: vs_response.document_length,
+                selection_start_utf16: vs_response.document_offset,
+                selection_end_utf16: vs_response.document_offset,
                 line_index: vs_response.line_number,
                 line_cursor_utf16,
                 line_cursor_chars: cursor_chars,
@@ -1473,7 +1513,7 @@ fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, Tex
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(Duration::from_millis(500)) {
+    match rx.recv_timeout(Duration::from_millis(150)) {
         Ok(result) => result,
         Err(_) => Err(TextReadResult::Failed("pipe_timeout")),
     }
@@ -2188,10 +2228,10 @@ mod tests {
     use super::{
         app_adapter_for_context, extract_line_from_document, ime_conversion_status_for_mode,
         ime_open_status_for_mode, input_mode_from_conversion_status, input_mode_from_open_status,
-        maybe_switch_watcher_mode, normalize_uia_text_for_adapter, resolve_ime_target_hwnd,
-        utf16_units_to_char_index, AppAdapter, ForegroundSnapshot, TextReadAttempt, TextSnapshot,
-        TrayRuntimeControl, WatcherSwitchOutcome, Wparam, IME_CMODE_NATIVE, WM_LBUTTONUP,
-        WM_RBUTTONUP,
+        looks_like_ime_composition, maybe_switch_watcher_mode, normalize_uia_text_for_adapter,
+        resolve_ime_target_hwnd, utf16_units_to_char_index, AppAdapter, ForegroundSnapshot,
+        TextReadAttempt, TextSnapshot, TrayRuntimeControl, WatcherSwitchOutcome, Wparam,
+        IME_CMODE_NATIVE, WM_LBUTTONUP, WM_RBUTTONUP,
     };
     use crate::ime::InputMode;
     use std::ptr::null_mut;
@@ -2606,6 +2646,115 @@ mod tests {
     }
 
     #[test]
+    fn detects_ime_composition_when_cursor_moves_to_end() {
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 11,
+            selection_start_utf16: 5,
+            selection_end_utf16: 5,
+            line_index: 0,
+            line_cursor_utf16: 5,
+            line_cursor_chars: 5,
+            line_text: "变成中文c".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
+    fn detects_ime_composition_when_cursor_stays_at_start() {
+        // Microsoft Pinyin in VS Code keeps cursor at composition start during preview.
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成中文c".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
+    fn detects_ime_composition_in_middle_of_line() {
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 2,
+            selection_end_utf16: 2,
+            line_index: 0,
+            line_cursor_utf16: 2,
+            line_cursor_chars: 2,
+            line_text: "变成中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 13,
+            selection_start_utf16: 5,
+            selection_end_utf16: 5,
+            line_index: 0,
+            line_cursor_utf16: 5,
+            line_cursor_chars: 5,
+            line_text: "变成ces中文".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
+    fn rejects_ime_composition_for_non_ascii_insertion() {
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 10,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成中文好".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(!looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
     fn classifies_supported_snapshot_line() {
         let mut snapshot = snapshot("hello world");
         snapshot.text_snapshot.line_cursor_chars = 1;
@@ -2874,46 +3023,39 @@ mod tests {
 
     #[test]
     fn vscode_extension_tries_for_code_exe() {
-        // Should attempt connection for Code.exe (will fail with pipe_connect_failed if extension not running)
+        // Should attempt connection for Code.exe.
+        // When the extension pipe server is not running: pipe_connect_failed.
+        // When the extension is active but has no editor: vscode_no_editor.
         let result = super::capture_vscode_extension_text("Code.exe");
         assert!(result.is_err());
-        // Verify it's the right error (pipe not available)
-        match result {
-            Err(super::TextReadResult::Failed(reason)) => {
-                assert_eq!(reason, "pipe_connect_failed");
-            }
-            _ => panic!("Expected Failed error"),
-        }
     }
 
     #[test]
     fn vscode_extension_tries_for_cursor_exe() {
-        // Should attempt connection for Cursor.exe
+        // Should attempt connection for Cursor.exe.
         let result = super::capture_vscode_extension_text("Cursor.exe");
         assert!(result.is_err());
-        match result {
-            Err(super::TextReadResult::Failed(reason)) => {
-                assert_eq!(reason, "pipe_connect_failed");
-            }
-            _ => panic!("Expected Failed error"),
-        }
     }
 
     #[test]
     fn vscode_line_response_parses_correctly() {
-        let json = r#"{"line": "const x = 1;", "cursor": 5, "lineNumber": 10, "totalLines": 100}"#;
+        let json = r#"{"line": "const x = 1;", "cursor": 5, "lineNumber": 10, "totalLines": 100, "documentOffset": 50, "documentLength": 200}"#;
         let response: super::VsCodeLineResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.line, "const x = 1;");
         assert_eq!(response.cursor, 5);
         assert_eq!(response.line_number, 10);
         assert_eq!(response.total_lines, 100);
+        assert_eq!(response.document_offset, 50);
+        assert_eq!(response.document_length, 200);
     }
 
     #[test]
     fn vscode_line_response_handles_unicode() {
-        let json = r#"{"line": "const 中文 = \"测试\";", "cursor": 8, "lineNumber": 3, "totalLines": 50}"#;
+        let json = r#"{"line": "const 中文 = \"测试\";", "cursor": 8, "lineNumber": 3, "totalLines": 50, "documentOffset": 20, "documentLength": 100}"#;
         let response: super::VsCodeLineResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.line, "const 中文 = \"测试\";");
         assert_eq!(response.cursor, 8);
+        assert_eq!(response.document_offset, 20);
+        assert_eq!(response.document_length, 100);
     }
 }

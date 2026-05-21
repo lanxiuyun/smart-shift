@@ -16,13 +16,15 @@ interface LineInfo {
     lineNumber: number;   // line number (0-based)
     totalLines: number;
     composing: boolean;   // whether user is actively typing (IME or fast typing)
+    documentOffset: number; // UTF-16 offset from document start to cursor
+    documentLength: number; // total document length in UTF-16 code units
 }
 
 let pipeServer: net.Server | null = null;
 let outputChannel: vscode.OutputChannel;
 let isComposing = false;  // Track active typing to prevent IME mid-switch
 let composingTimer: NodeJS.Timeout | null = null;
-const COMPOSING_DEBOUNCE_MS = 800;
+const COMPOSING_DEBOUNCE_MS = 300;
 
 export function activate(context: vscode.ExtensionContext) {
     outputChannel = vscode.window.createOutputChannel('Smart Shift');
@@ -54,6 +56,7 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+
     // Start Named Pipe server
     startPipeServer();
 
@@ -84,19 +87,15 @@ function startPipeServer() {
     }
 
     pipeServer = net.createServer((socket) => {
-        outputChannel.appendLine('Client connected');
-
         socket.on('data', (data) => {
             try {
                 const request = data.toString().trim();
-                outputChannel.appendLine(`Received request: ${request}`);
 
                 if (request === 'GET_LINE') {
                     const editor = vscode.window.activeTextEditor;
                     if (editor) {
                         const info = getLineInfo(editor);
                         const response = JSON.stringify(info);
-                        outputChannel.appendLine(`Sending response: ${response}`);
                         socket.write(response + '\n');
                     } else {
                         const errorResponse = JSON.stringify({ error: 'no_editor' });
@@ -105,9 +104,7 @@ function startPipeServer() {
                 } else if (request === 'PING') {
                     socket.write('PONG\n');
                 }
-                // Gracefully end the socket after responding so the client
-                // sees EOF and can close its handle cleanly.
-                socket.end();
+                // Keep socket alive for subsequent requests (long-lived pipe)
             } catch (err) {
                 outputChannel.appendLine(`Socket handler error: ${err}`);
                 socket.destroy();
@@ -116,10 +113,6 @@ function startPipeServer() {
 
         socket.on('error', (err) => {
             outputChannel.appendLine(`Socket error: ${err.message}`);
-        });
-
-        socket.on('close', () => {
-            outputChannel.appendLine('Client disconnected');
         });
     });
 
@@ -155,7 +148,9 @@ function getLineInfo(editor: vscode.TextEditor): LineInfo {
         cursor: position.character,
         lineNumber: position.line,
         totalLines: document.lineCount,
-        composing: isComposing
+        composing: isComposing,
+        documentOffset: document.offsetAt(position),
+        documentLength: document.getText().length
     };
 }
 
