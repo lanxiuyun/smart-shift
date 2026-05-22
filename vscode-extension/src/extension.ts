@@ -48,7 +48,7 @@ let outputChannel: vscode.OutputChannel;
 let statusBarItem: vscode.StatusBarItem;
 let isComposing = false;
 let composingTimer: NodeJS.Timeout | null = null;
-const COMPOSING_DEBOUNCE_MS = 1500;
+const COMPOSING_DEBOUNCE_MS = 8000;
 
 let lastEventLogs: EventLog[] = [];
 let lastActivityAt = 0;
@@ -89,10 +89,8 @@ function isCjk(ch: string): boolean {
 function looksLikePinyinComposition(lineText: string, cursor: number): boolean {
     if (cursor <= 0 || cursor > lineText.length) return false;
     const prevChar = lineText.charAt(cursor - 1);
-    if (!prevChar.match(/[a-z]/)) return false;
-    const beforePrev = cursor >= 2 ? lineText.charAt(cursor - 2) : '';
-    const afterCurr = cursor < lineText.length ? lineText.charAt(cursor) : '';
-    return isCjk(beforePrev) || isCjk(afterCurr);
+    // 只要前一个字符是拼音字母，且当前处于 composing 状态，就认为是拼音合成
+    return /[a-z]/.test(prevChar);
 }
 
 function logEvent(type: EventLog['type'], detail: string, line?: number, cursor?: number) {
@@ -470,11 +468,17 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
             const change = e.contentChanges[0];
-            const isTyping = change.text.length > 0;
+            const inserted = change.text;
             const pos = editor.selection.active;
-            if (isTyping) {
-                setComposing(true);
-                logEvent('document', '输入 "' + change.text.replace(/\n/g, '\\n') + '"', pos.line, pos.character);
+            if (inserted.length > 0) {
+                // 纯小写字母 → 可能是拼音输入（IME composition）
+                if (/^[a-z]+$/.test(inserted)) {
+                    setComposing(true);
+                } else {
+                    // 包含汉字/大写/数字/符号/换行 → composition 上屏或普通输入，结束 composing
+                    setComposing(false);
+                }
+                logEvent('document', '输入 "' + inserted.replace(/\n/g, '\\n') + '"', pos.line, pos.character);
             } else {
                 logEvent('document', '删除', pos.line, pos.character);
             }
@@ -508,9 +512,17 @@ export function activate(context: vscode.ExtensionContext) {
             } else {
                 detail = '切换行' + reasonStr + ': L' + ((lastEditorState?.line ?? -1) + 1) + ' -> L' + (pos.line + 1);
             }
-            if (isComposing && looksLikePinyinComposition(line.text, pos.character)) {
-                setComposing(true);
-                detail += ' [拼音合成中]';
+            if (isComposing) {
+                if (e.kind === vscode.TextEditorSelectionChangeKind.Mouse || e.kind === vscode.TextEditorSelectionChangeKind.Command) {
+                    // 鼠标点击或命令跳转大概率结束 IME composition
+                    setComposing(false);
+                } else {
+                    // keyboard 移动，可能是选字，刷新超时
+                    setComposing(true);
+                    if (looksLikePinyinComposition(line.text, pos.character)) {
+                        detail += ' [拼音合成中]';
+                    }
+                }
             }
             logEvent('selection', detail, pos.line, pos.character);
             updateCachedState(editor);
@@ -531,6 +543,7 @@ export function activate(context: vscode.ExtensionContext) {
                 cachedLineInfo = null;
                 lastEditorState = null;
             }
+            setComposing(false);
             SmartShiftMonitorPanel.refresh();
         })
     );

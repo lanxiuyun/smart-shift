@@ -550,12 +550,16 @@ fn looks_like_typing(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
     prefix_matches && suffix_matches
 }
 
-/// Detect if the line text change looks like IME composition (pinyin input).
-/// This checks that the previous line text is a prefix of the current line text,
-/// and the inserted part consists of lowercase ASCII letters or apostrophes.
-/// For example: "变成中文" → "变成ces中文" (inserted "ces" before "中文")
-/// Also handles IME composition preview where the cursor stays at the insertion
-/// start (e.g. Microsoft Pinyin in VS Code).
+/// Detect if the line text change looks like IME composition (pinyin input)
+/// or IME commit (pinyin replaced by CJK characters).
+///
+/// Composition cases (current longer than previous):
+/// - "变成中文" → "变成ces中文" (inserted "ces" before "中文")
+/// - Also handles IME composition preview where the cursor stays at the insertion
+///   start (e.g. Microsoft Pinyin in VS Code).
+///
+/// Commit case (pinyin replaced by CJK):
+/// - "变成ces中文" → "变成测试中文" ("ces" replaced by "测试")
 fn looks_like_ime_composition(previous: &TextSnapshot, current: &TextSnapshot) -> bool {
     // Must be on the same line
     if previous.line_index != current.line_index {
@@ -568,51 +572,89 @@ fn looks_like_ime_composition(previous: &TextSnapshot, current: &TextSnapshot) -
     let prev_len = prev_chars.len();
     let curr_len = curr_chars.len();
 
-    // Current must be longer than previous (something was inserted)
-    if curr_len <= prev_len {
-        return false;
-    }
+    // Case 1-3: insertion (current longer than previous)
+    if curr_len > prev_len {
+        let inserted_count = curr_len - prev_len;
+        let cursor = current.line_cursor_chars;
+        let prev_cursor = previous.line_cursor_chars;
 
-    let inserted_count = curr_len - prev_len;
-    let cursor = current.line_cursor_chars;
-    let prev_cursor = previous.line_cursor_chars;
+        // Case 1: cursor moved to end of insertion (normal typing / some IMEs)
+        if cursor == prev_cursor + inserted_count {
+            let insert_start = prev_cursor;
+            if insert_start <= prev_len
+                && curr_chars[..insert_start] == prev_chars[..insert_start]
+                && curr_chars[cursor..] == prev_chars[insert_start..]
+            {
+                let inserted = &curr_chars[insert_start..cursor];
+                return !inserted.is_empty()
+                    && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+            }
+        }
 
-    // Case 1: cursor moved to end of insertion (normal typing / some IMEs)
-    if cursor == prev_cursor + inserted_count {
-        let insert_start = prev_cursor;
-        if insert_start <= prev_len
-            && curr_chars[..insert_start] == prev_chars[..insert_start]
-            && curr_chars[cursor..] == prev_chars[insert_start..]
-        {
-            let inserted = &curr_chars[insert_start..cursor];
-            return !inserted.is_empty()
-                && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+        // Case 2: cursor stayed at insertion start (IME composition preview)
+        if cursor == prev_cursor {
+            if cursor <= prev_len
+                && curr_chars[..cursor] == prev_chars[..cursor]
+                && curr_chars[cursor + inserted_count..] == prev_chars[cursor..]
+            {
+                let inserted = &curr_chars[cursor..cursor + inserted_count];
+                return !inserted.is_empty()
+                    && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+            }
+        }
+
+        // Case 3: cursor is inside the inserted block (some IMEs place cursor
+        // within the composition string rather than at start or end).
+        if cursor > prev_cursor && cursor < prev_cursor + inserted_count {
+            let insert_start = prev_cursor;
+            if insert_start <= prev_len
+                && curr_chars[..insert_start] == prev_chars[..insert_start]
+                && curr_chars[prev_cursor + inserted_count..] == prev_chars[insert_start..]
+            {
+                let inserted = &curr_chars[insert_start..prev_cursor + inserted_count];
+                return !inserted.is_empty()
+                    && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+            }
         }
     }
 
-    // Case 2: cursor stayed at insertion start (IME composition preview)
-    if cursor == prev_cursor {
-        if cursor <= prev_len
-            && curr_chars[..cursor] == prev_chars[..cursor]
-            && curr_chars[cursor + inserted_count..] == prev_chars[cursor..]
-        {
-            let inserted = &curr_chars[cursor..cursor + inserted_count];
-            return !inserted.is_empty()
-                && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
-        }
-    }
+    // Case 4: IME commit — pinyin replaced by CJK characters.
+    // For example: "ces" → "测试", "ce'shi" → "测试", "ces" → "测试一下"
+    let common_prefix_len = prev_chars
+        .iter()
+        .zip(curr_chars.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let max_suffix = (prev_len - common_prefix_len).min(curr_len - common_prefix_len);
+    let common_suffix_len = if max_suffix > 0 {
+        prev_chars[prev_len - max_suffix..]
+            .iter()
+            .zip(curr_chars[curr_len - max_suffix..].iter())
+            .rev()
+            .take_while(|(a, b)| a == b)
+            .count()
+    } else {
+        0
+    };
 
-    // Case 3: cursor is inside the inserted block (some IMEs place cursor
-    // within the composition string rather than at start or end).
-    if cursor > prev_cursor && cursor < prev_cursor + inserted_count {
-        let insert_start = prev_cursor;
-        if insert_start <= prev_len
-            && curr_chars[..insert_start] == prev_chars[..insert_start]
-            && curr_chars[prev_cursor + inserted_count..] == prev_chars[insert_start..]
+    if common_prefix_len + common_suffix_len <= prev_len
+        && common_prefix_len + common_suffix_len <= curr_len
+    {
+        let prev_changed = &prev_chars[common_prefix_len..prev_len - common_suffix_len];
+        let curr_changed = &curr_chars[common_prefix_len..curr_len - common_suffix_len];
+
+        let left_is_cjk = common_prefix_len > 0
+            && is_cjk(prev_chars[common_prefix_len - 1]);
+        let right_is_cjk = common_suffix_len > 0
+            && is_cjk(prev_chars[prev_len - common_suffix_len]);
+
+        if !prev_changed.is_empty()
+            && prev_changed.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'')
+            && !curr_changed.is_empty()
+            && curr_changed.iter().all(|&ch| is_cjk(ch))
+            && (left_is_cjk || right_is_cjk)
         {
-            let inserted = &curr_chars[insert_start..prev_cursor + inserted_count];
-            return !inserted.is_empty()
-                && inserted.iter().all(|&ch| ch.is_ascii_lowercase() || ch == '\'');
+            return true;
         }
     }
 
@@ -3164,6 +3206,119 @@ mod tests {
             super::classify_snapshot_transition_with_state(Some(&previous), &current, false),
             super::SnapshotTransition::Ignore
         );
+    }
+
+    #[test]
+    fn detects_ime_commit_pinyin_to_cjk_shorter() {
+        // "ces" (3 chars) → "测试" (2 chars)
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 13,
+            selection_start_utf16: 5,
+            selection_end_utf16: 5,
+            line_index: 0,
+            line_cursor_utf16: 5,
+            line_cursor_chars: 5,
+            line_text: "变成ces中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 12,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成测试中文".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
+    fn detects_ime_commit_pinyin_to_cjk_longer() {
+        // "ces" (3 chars) → "测试一下" (4 chars)
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 13,
+            selection_start_utf16: 5,
+            selection_end_utf16: 5,
+            line_index: 0,
+            line_cursor_utf16: 5,
+            line_cursor_chars: 5,
+            line_text: "变成ces中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 14,
+            selection_start_utf16: 6,
+            selection_end_utf16: 6,
+            line_index: 0,
+            line_cursor_utf16: 6,
+            line_cursor_chars: 6,
+            line_text: "变成测试一下中文".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
+    fn detects_ime_commit_pinyin_with_apostrophe() {
+        // "ce'shi" (6 chars) → "测试" (2 chars)
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 16,
+            selection_start_utf16: 8,
+            selection_end_utf16: 8,
+            line_index: 0,
+            line_cursor_utf16: 8,
+            line_cursor_chars: 8,
+            line_text: "变成ce'shi中文".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 12,
+            selection_start_utf16: 4,
+            selection_end_utf16: 4,
+            line_index: 0,
+            line_cursor_utf16: 4,
+            line_cursor_chars: 4,
+            line_text: "变成测试中文".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(looks_like_ime_composition(&previous, &current));
+    }
+
+    #[test]
+    fn rejects_normal_edit_as_ime_commit() {
+        // Manual edit in English context: "abc hello def" → "abc 你好 def"
+        // "hello" is surrounded by spaces (not CJK), so it should NOT be detected as IME commit.
+        let previous = TextSnapshot {
+            source: "test",
+            document_len_utf16: 13,
+            selection_start_utf16: 8,
+            selection_end_utf16: 8,
+            line_index: 0,
+            line_cursor_utf16: 8,
+            line_cursor_chars: 8,
+            line_text: "abc hello def".to_string(),
+            attempts: Vec::new(),
+        };
+        let current = TextSnapshot {
+            source: "test",
+            document_len_utf16: 11,
+            selection_start_utf16: 6,
+            selection_end_utf16: 6,
+            line_index: 0,
+            line_cursor_utf16: 6,
+            line_cursor_chars: 6,
+            line_text: "abc 你好 def".to_string(),
+            attempts: Vec::new(),
+        };
+        assert!(!looks_like_ime_composition(&previous, &current));
     }
 
     #[test]
