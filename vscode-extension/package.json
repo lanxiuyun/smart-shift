@@ -19,6 +19,10 @@
       {
         "command": "smart-shift.status",
         "title": "Smart Shift: Show Status"
+      },
+      {
+        "command": "smart-shift.showDebugPanel",
+        "title": "Smart Shift: Show Monitor Panel"
       }
     ]
   },
