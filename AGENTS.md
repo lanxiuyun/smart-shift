@@ -131,8 +131,18 @@ npm install
 npm run compile
 
 # Package as .vsix
-vsce package
+npx vsce package --allow-missing-repository --allow-star-activation
+
+# Install to Cursor (Windows)
+"cursor" --install-extension smart-shift-vscode-0.1.0.vsix --force
 ```
+
+**Agent workflow**: After every change to `vscode-extension/src/extension.ts`, the agent must:
+1. Run `cd vscode-extension && npm run compile && npx vsce package --allow-missing-repository --allow-star-activation`
+2. Immediately install the newly built `.vsix` to Cursor using the command above.
+3. Prompt the user to reload the window (`Developer: Reload Window`) to activate the new version.
+
+The extension provides a **Webview Monitor Panel** (`Smart Shift Monitor`) for real-time debugging of cursor position, events, and Named Pipe communication. If the panel shows a Service Worker error, ensure the HTML includes `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">`.
 
 ---
 
