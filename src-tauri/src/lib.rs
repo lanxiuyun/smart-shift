@@ -126,6 +126,8 @@ fn get_recent_log_lines(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
+
     let event_logger = Arc::new(EventLogger::new(
         EventLogger::default_log_dir()
             .unwrap_or_else(|_| std::env::temp_dir().join("smart-shift").join("logs")),

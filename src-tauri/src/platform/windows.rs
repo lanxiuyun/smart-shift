@@ -1516,12 +1516,9 @@ static VSCODE_PIPE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
 /// Try to read current line from VS Code extension via Named Pipe.
 /// Reuses a cached pipe connection to avoid reconnect overhead on every poll.
-fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, TextReadResult> {
-    // Only try for known VS Code-based editors
-    if !matches_known_chromium_editor_process(process_name) {
-        return Err(TextReadResult::Unsupported("not_vscode_editor"));
-    }
-
+/// We attempt the pipe regardless of process name: if the extension is running,
+/// it is the most reliable source for Monaco editors (VS Code, Cursor, VSCodium, etc.).
+fn capture_vscode_extension_text(_process_name: &str) -> Result<TextSnapshot, TextReadResult> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
@@ -1543,7 +1540,10 @@ fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, Tex
             };
 
             p.write_all(b"GET_LINE\n")
-                .map_err(|_| TextReadResult::Failed("pipe_write_failed"))?;
+                .map_err(|e| {
+                    log::warn!("vscode_extension pipe write failed: {}", e);
+                    TextReadResult::Failed("pipe_write_failed")
+                })?;
 
             let mut response = String::new();
             let mut buf = [0u8; 4096];
@@ -1556,7 +1556,10 @@ fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, Tex
                             break;
                         }
                     }
-                    Err(_) => return Err(TextReadResult::Failed("pipe_read_failed")),
+                    Err(e) => {
+                        log::warn!("vscode_extension pipe read failed: {}", e);
+                        return Err(TextReadResult::Failed("pipe_read_failed"));
+                    }
                 }
             }
 
@@ -1567,6 +1570,15 @@ fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, Tex
             }
 
             let response = response.trim();
+            log::info!(
+                "vscode_extension pipe raw response (len={}): {}",
+                response.len(),
+                if response.len() > 200 {
+                    &response[..200]
+                } else {
+                    response
+                }
+            );
 
             // Check for error response
             if response.contains("\"error\"") {
@@ -1574,10 +1586,24 @@ fn capture_vscode_extension_text(process_name: &str) -> Result<TextSnapshot, Tex
             }
 
             let vs_response: VsCodeLineResponse =
-                serde_json::from_str(response).map_err(|_| TextReadResult::Failed("pipe_parse_failed"))?;
+                serde_json::from_str(response).map_err(|e| {
+                    log::warn!("vscode_extension pipe parse failed: {} raw={}", e, response);
+                    TextReadResult::Failed("pipe_parse_failed")
+                })?;
 
             let line_text = vs_response.line;
             let cursor_chars = vs_response.cursor;
+
+            // Defensive: if extension reports empty line in a completely empty document,
+            // treat it as a failure so we can fallback to app_adapter.
+            if line_text.is_empty() && vs_response.document_length == 0 {
+                log::warn!(
+                    "vscode_extension returned empty line for empty document (line={})",
+                    vs_response.line_number
+                );
+                return Err(TextReadResult::Failed("vscode_empty_doc"));
+            }
+
             let line_cursor_utf16 = line_text[..line_text.chars().take(cursor_chars).collect::<String>().len()]
                 .encode_utf16()
                 .count();
