@@ -3,7 +3,7 @@ use crate::config::AppConfig;
 use crate::context::LineContext;
 use crate::ime::InputMode;
 use crate::logger::EventLogger;
-use std::sync::RwLock;
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::ffi::c_void;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -235,6 +235,14 @@ impl ForegroundWatcher {
                 Ok(snapshot) => {
                     last_error = None;
 
+                    // Emit VS Code extension debug events to frontend
+                    if let Some(app_handle) = &self.app_handle {
+                        let events = take_vscode_recent_events();
+                        if !events.is_empty() {
+                            let _ = app_handle.emit("vscode-events", events);
+                        }
+                    }
+
                     // Check blacklist / whitelist
                     if let Ok(cfg) = self.app_config.read() {
                         if !cfg.is_app_allowed(&snapshot.process_name) {
@@ -304,6 +312,14 @@ impl ForegroundWatcher {
             match capture_foreground_snapshot() {
                 Ok(snapshot) => {
                     last_error = None;
+
+                    // Emit VS Code extension debug events to frontend
+                    if let Some(app_handle) = &self.app_handle {
+                        let events = take_vscode_recent_events();
+                        if !events.is_empty() {
+                            let _ = app_handle.emit("vscode-events", events);
+                        }
+                    }
 
                     // Skip IME switching if the user is actively composing
                     if is_ime_composing(snapshot.focus_hwnd as HWND)
@@ -1492,6 +1508,18 @@ fn extract_line_from_document(document_text: &str, cursor_char_offset: usize) ->
 
 const VSCODE_PIPE_PATH: &str = r"\\.\pipe\smart-shift-vscode";
 
+static VSCODE_RECENT_EVENTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn store_vscode_recent_events(events: Vec<String>) {
+    let mut guard = VSCODE_RECENT_EVENTS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+    *guard = events;
+}
+
+fn take_vscode_recent_events() -> Vec<String> {
+    let mut guard = VSCODE_RECENT_EVENTS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+    std::mem::take(&mut *guard)
+}
+
 /// Response from VS Code extension's Named Pipe
 #[derive(serde::Deserialize)]
 struct VsCodeLineResponse {
@@ -1504,13 +1532,13 @@ struct VsCodeLineResponse {
     total_lines: usize,
     #[serde(default)]
     composing: bool,
+    #[serde(default, rename = "recent_events")]
+    recent_events: Vec<String>,
     #[serde(rename = "documentOffset")]
     document_offset: usize,
     #[serde(rename = "documentLength")]
     document_length: usize,
 }
-
-use std::sync::{Mutex, OnceLock};
 
 static VSCODE_PIPE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
@@ -1607,6 +1635,11 @@ fn capture_vscode_extension_text(_process_name: &str) -> Result<TextSnapshot, Te
             let line_cursor_utf16 = line_text[..line_text.chars().take(cursor_chars).collect::<String>().len()]
                 .encode_utf16()
                 .count();
+
+            // Cache extension events for frontend display
+            if !vs_response.recent_events.is_empty() {
+                store_vscode_recent_events(vs_response.recent_events);
+            }
 
             // If IME is composing, mark source so the watcher skips switching
             // instead of falling back to unreliable adapters.

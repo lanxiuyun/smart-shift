@@ -56,6 +56,8 @@ const error = ref("");
 const startupErrors = ref<string[]>([]);
 const liveLogs = ref<WatcherEventPayload[]>([]);
 const maxLiveLogs = 100;
+const vscodeEvents = ref<string[]>([]);
+const maxVscodeEvents = 50;
 
 const config = ref<AppConfig>({
   poll_interval_ms: 250,
@@ -69,6 +71,8 @@ const newBlacklistItem = ref("");
 let pollTimer: number | null = null;
 let unlistenWatcher: (() => void) | null = null;
 let unlistenStartup: (() => void) | null = null;
+let unlistenVscodeEvents: (() => void) | null = null;
+let logListResizeObserver: ResizeObserver | null = null;
 
 function formatError(errorLike: unknown): string {
   if (errorLike instanceof Error) {
@@ -222,6 +226,28 @@ onMounted(async () => {
   unlistenStartup = await listen<string[]>("startup-check-failed", (event) => {
     startupErrors.value = event.payload;
   });
+
+  unlistenVscodeEvents = await listen<string[]>("vscode-events", (event) => {
+    vscodeEvents.value.unshift(...event.payload);
+    if (vscodeEvents.value.length > maxVscodeEvents) {
+      vscodeEvents.value = vscodeEvents.value.slice(0, maxVscodeEvents);
+    }
+  });
+
+  // Restore and observe log-list height for resizable panel
+  const logListEl = document.querySelector('.log-list') as HTMLElement | null;
+  if (logListEl) {
+    const saved = localStorage.getItem('smartShiftLogHeight');
+    if (saved) {
+      logListEl.style.height = saved + 'px';
+    }
+    logListResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        localStorage.setItem('smartShiftLogHeight', String(entry.contentRect.height));
+      }
+    });
+    logListResizeObserver.observe(logListEl);
+  }
 });
 
 onUnmounted(() => {
@@ -233,6 +259,12 @@ onUnmounted(() => {
   }
   if (unlistenStartup) {
     unlistenStartup();
+  }
+  if (unlistenVscodeEvents) {
+    unlistenVscodeEvents();
+  }
+  if (logListResizeObserver) {
+    logListResizeObserver.disconnect();
   }
 });
 </script>
@@ -377,7 +409,18 @@ onUnmounted(() => {
       </p>
 
       <div class="log-panel">
-        <h3>Event log</h3>
+        <h3>VS Code Extension Events</h3>
+        <div class="vscode-event-list">
+          <div v-if="vscodeEvents.length === 0" class="log-empty">No extension events yet.</div>
+          <div
+            v-for="(evt, index) in vscodeEvents"
+            :key="`vscode-${index}`"
+            class="vscode-event-item"
+          >
+            {{ evt }}
+          </div>
+        </div>
+        <h3 style="margin-top: 16px;">Event log</h3>
         <div class="log-list">
           <div v-if="liveLogs.length === 0" class="log-empty">No live events yet.</div>
           <div
@@ -607,14 +650,40 @@ h3 {
   margin-top: 16px;
 }
 
-.log-list {
-  max-height: 320px;
+.vscode-event-list {
+  max-height: 200px;
   margin-top: 10px;
   overflow-y: auto;
   padding: 10px;
   border: 1px solid #e2e8f0;
   border-radius: 16px;
   background: rgba(245, 247, 251, 0.8);
+}
+
+.vscode-event-item {
+  padding: 4px 8px;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  color: #4b5565;
+  font-family: "SF Mono", "Consolas", monospace;
+  line-height: 1.5;
+}
+
+.vscode-event-item:nth-child(odd) {
+  background: rgba(228, 232, 240, 0.5);
+}
+
+.log-list {
+  height: 320px;
+  min-height: 150px;
+  max-height: 80vh;
+  margin-top: 10px;
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  background: rgba(245, 247, 251, 0.8);
+  resize: vertical;
 }
 
 .log-empty {

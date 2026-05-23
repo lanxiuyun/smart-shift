@@ -21,8 +21,8 @@
         "title": "Smart Shift: Show Status"
       },
       {
-        "command": "smart-shift.pingDaemon",
-        "title": "Smart Shift: Ping Daemon"
+        "command": "smart-shift.showDebugPanel",
+        "title": "Smart Shift: Open Monitor Panel"
       }
     ]
   },
